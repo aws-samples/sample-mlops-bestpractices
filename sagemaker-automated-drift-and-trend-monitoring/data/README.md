@@ -44,14 +44,19 @@ When to use:
 
 A smaller dataset with intentional feature drift applied, used to validate that the monitoring system detects distribution shifts.
 
-- Rows: 5,000
+- Rows: 5,000 (configurable via `drift_generation.num_samples` in `src/config/config.yaml`)
 - Columns: Same 35 as predictions_final
-- Drift applied to 5 key features:
+- Drift applied to 5 key features (default values shown, **all configurable in `src/config/config.yaml`**):
   - `transaction_amount`: +40% multiplicative increase (simulates inflation)
   - `transaction_timestamp`: +50,000 additive shift (simulates future time period)
   - `distance_from_home_km`: 2x multiplicative increase (simulates travel/remote transactions)
   - `velocity_score`: 1.5x multiplicative increase (simulates more active users)
   - `num_transactions_24h`: +3 additive shift (simulates higher transaction frequency)
+
+**To adjust drift amounts:** Edit `src/config/config.yaml` under `drift_generation.default_drift`, then regenerate:
+```bash
+python src/drift_monitoring/generate_drift_dataset.py
+```
 
 When to use:
 - Testing drift detection in `notebooks/2a_inference_monitoring.ipynb`

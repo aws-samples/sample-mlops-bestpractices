@@ -241,6 +241,141 @@ cloudwatch:
 monitoring:
   lookback_days: 30
   min_samples_for_drift: 100
+  data_drift_lookback_days: 1    # Days of inference data to compare for data drift
+  model_drift_lookback_days: 1   # Days of inference data to compare for model drift
+
+# ---------------------------------------------------------------------------
+# Drift Generation Configuration
+# ---------------------------------------------------------------------------
+# These parameters control how drifted datasets are generated for testing.
+# Used by: generate_drift_dataset.py and generate_variable_drift_dataset.py
+#
+# FEATURE DRIFT PARAMETERS:
+# - type: "multiplicative" (value *= factor) or "additive" (value += shift)
+# - factor: Multiplier for multiplicative drift (1.0 = no change, 2.0 = double)
+# - shift: Amount to add for additive drift
+# - noise: Random variation around factor/shift
+#
+drift_generation:
+  # Default drift dataset (generate_drift_dataset.py)
+  # Applies consistent drift to 5 key features
+  default_drift:
+    transaction_amount:
+      type: "multiplicative"
+      factor: 1.1      # 10% increase (reduced from 1.4)
+      noise: 0.05      # ±5% random variation (reduced from 0.1)
+
+    transaction_timestamp:
+      type: "additive"
+      shift: 10000     # Shift time forward (reduced from 50000)
+      noise: 1000      # ±1000 random variation (reduced from 5000)
+
+    distance_from_home_km:
+      type: "multiplicative"
+      factor: 1.2      # 20% increase (reduced from 2.0)
+      noise: 0.1       # ±10% random variation (reduced from 0.3)
+
+    velocity_score:
+      type: "multiplicative"
+      factor: 1.15     # 15% increase (reduced from 1.5)
+      noise: 0.1       # ±10% random variation (reduced from 0.2)
+
+    num_transactions_24h:
+      type: "additive"
+      shift: 1         # Add 1 more transaction on average (reduced from 3)
+      noise: 0.5       # ±0.5 transaction variation (reduced from 1)
+
+  # Variable drift patterns (generate_variable_drift_dataset.py)
+  # Simulates 6 different time periods with unique drift characteristics
+  variable_patterns:
+    # Run 1: Baseline - Minimal drift (normal operations)
+    run1:
+      transaction_amount:
+        factor: 1.05
+        noise: 0.05
+      distance_from_home_km:
+        factor: 1.1
+        noise: 0.1
+
+    # Run 2: Distance spike - Remote/travel transactions increase
+    run2:
+      transaction_amount:
+        factor: 1.1
+        noise: 0.1
+      distance_from_home_km:
+        factor: 3.5      # MAJOR SPIKE
+        noise: 0.5
+      velocity_score:
+        factor: 1.3
+        noise: 0.2
+      num_transactions_24h:
+        shift: 2
+        noise: 1
+
+    # Run 3: Credit limit anomaly - System changes or data quality issue
+    run3:
+      transaction_amount:
+        factor: 1.15
+        noise: 0.1
+      credit_limit:
+        factor: 8.0      # EXTREME SPIKE (creates PSI ~74)
+        noise: 2.0
+      distance_from_home_km:
+        factor: 2.0
+        noise: 0.3
+      merchant_category_code:
+        shift: 500
+        noise: 200
+
+    # Run 4: High velocity period - Increased transaction frequency
+    run4:
+      transaction_amount:
+        factor: 1.4
+        noise: 0.2
+      velocity_score:
+        factor: 2.5      # MAJOR SPIKE
+        noise: 0.4
+      num_transactions_24h:
+        shift: 5         # MAJOR SPIKE
+        noise: 2
+      distance_from_home_km:
+        factor: 1.5
+        noise: 0.2
+      max_transaction_amount_30days:
+        factor: 1.6
+        noise: 0.3
+
+    # Run 5: Recovery - Returning to normal with residual drift
+    run5:
+      transaction_amount:
+        factor: 1.2
+        noise: 0.15
+      distance_from_home_km:
+        factor: 1.3
+        noise: 0.2
+      velocity_score:
+        factor: 1.2
+        noise: 0.15
+
+    # Run 6: Account age anomaly - New user cohort or system change
+    run6:
+      transaction_amount:
+        factor: 1.1
+        noise: 0.1
+      account_age_days:
+        factor: 0.3      # Younger accounts
+        noise: 0.1
+      distance_from_home_km:
+        factor: 1.4
+        noise: 0.2
+      customer_tenure_months:
+        factor: 0.4
+        noise: 0.15
+
+  # Number of samples per dataset
+  num_samples: 5000
+  num_samples_per_run: 2000  # For variable drift runs
+  random_state: 123          # For reproducibility
 
 # ---------------------------------------------------------------------------
 # Ground Truth Simulation (Development/Testing)
@@ -287,7 +422,7 @@ ground_truth_simulation:
   # Default: 0.90 (90% baseline accuracy)
   #
   # Modify to: 0.95 for higher baseline, 0.85 for lower baseline
-  default_accuracy: 0.90
+  default_accuracy: 0.95
 
   # -------------------------------------------------------------------------
   # Confirmation Timing (Days)
@@ -321,7 +456,7 @@ ground_truth_simulation:
   # - 0.8+: Extreme drift (70%+ shift) - critical alert
   #
   # Example: Set to 0.3 to simulate post-COVID shopping behavior changes
-  feature_drift_magnitude: 0.01
+  feature_drift_magnitude: 0.0
 
   # FEATURE DRIFT COUNT
   # Range: 0-N (where N = total number of features)
@@ -335,7 +470,7 @@ ground_truth_simulation:
   #
   # Example: Set to 1 with high magnitude (0.5) to simulate single feature anomaly
   #          Set to 10 with low magnitude (0.1) to simulate gradual ecosystem drift
-  feature_drift_count: 4
+  feature_drift_count: 0
 
   # FEATURE DRIFT IMPACT
   # Range: 0.0-1.0 (0.0 = no impact, 1.0 = complete failure)
@@ -352,7 +487,7 @@ ground_truth_simulation:
   #
   # Example: feature_drift_magnitude=0.5, feature_drift_impact=0.10
   #          → accuracy drops from 90% to ~85% (5% degradation)
-  feature_drift_impact: 0.05
+  feature_drift_impact: 0.0
 
   # -------------------------------------------------------------------------
   # Model Drift Parameters
@@ -373,7 +508,7 @@ ground_truth_simulation:
   #
   # Use case: Fraud patterns evolve but transaction features stay same
   # Example: Set to 0.15 to simulate fraudsters adapting to detection
-  model_drift_magnitude: 0.05
+  model_drift_magnitude: 0.0
 
   # -------------------------------------------------------------------------
   # Random Seed (Reproducibility)

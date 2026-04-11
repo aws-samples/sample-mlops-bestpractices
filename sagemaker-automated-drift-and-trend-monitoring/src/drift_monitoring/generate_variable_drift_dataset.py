@@ -4,15 +4,24 @@ Generate datasets with time-varying drift patterns for realistic monitoring.
 This creates multiple drifted datasets simulating different monitoring runs,
 where specific features exhibit unique drift patterns at different times.
 
+All drift patterns (run1-run6) are configured in src/config/config.yaml under
+'drift_generation.variable_patterns'. No values are hardcoded.
+
+To adjust drift amounts (e.g., reduce credit_limit spike from 8x to 1.5x):
+1. Edit src/config/config.yaml → drift_generation.variable_patterns.run3
+2. Run this script to regenerate the drifted CSVs
+3. Test with the new drift levels
+
 Usage:
     python src/drift_monitoring/generate_variable_drift_dataset.py
 
     This will generate multiple CSV files representing different time periods:
     - data/drifted_data_run1.csv  (baseline - minimal drift)
     - data/drifted_data_run2.csv  (moderate drift, distance_from_home spikes)
-    - data/drifted_data_run3.csv  (high credit_limit drift)
+    - data/drifted_data_run3.csv  (high credit_limit drift - configurable)
     - data/drifted_data_run4.csv  (velocity & transaction spikes)
     - data/drifted_data_run5.csv  (return to normal with residual drift)
+    - data/drifted_data_run6.csv  (account age anomaly)
 """
 
 import pandas as pd
@@ -23,69 +32,39 @@ from pathlib import Path
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.config.config import CSV_TRAINING_DATA, DATA_DIR
+from src.config.config import (
+    CSV_TRAINING_DATA,
+    DATA_DIR,
+    DRIFT_GEN_VARIABLE_PATTERNS,
+    DRIFT_GEN_NUM_SAMPLES_PER_RUN,
+    DRIFT_GEN_RANDOM_STATE,
+)
 
-# Configuration
+# Configuration (now read from config.yaml)
 ORIGINAL_DATA_PATH = CSV_TRAINING_DATA
-NUM_SAMPLES_PER_RUN = 2000
-RANDOM_STATE_BASE = 123
+NUM_SAMPLES_PER_RUN = DRIFT_GEN_NUM_SAMPLES_PER_RUN
+RANDOM_STATE_BASE = DRIFT_GEN_RANDOM_STATE
 
-# Define drift patterns for different monitoring runs
+# Define drift patterns for different monitoring runs (now read from config.yaml)
 # Each run simulates a different time period with unique drift characteristics
-DRIFT_PATTERNS = {
-    "run1": {
-        "description": "Baseline - Minimal drift (normal operations)",
-        "features": {
-            "transaction_amount": {"factor": 1.05, "noise": 0.05},
-            "distance_from_home_km": {"factor": 1.1, "noise": 0.1},
-        }
-    },
-    "run2": {
-        "description": "Distance spike - Remote/travel transactions increase",
-        "features": {
-            "transaction_amount": {"factor": 1.1, "noise": 0.1},
-            "distance_from_home_km": {"factor": 3.5, "noise": 0.5},  # SPIKE!
-            "velocity_score": {"factor": 1.3, "noise": 0.2},
-            "num_transactions_24h": {"shift": 2, "noise": 1},
-        }
-    },
-    "run3": {
-        "description": "Credit limit anomaly - System changes or data quality issue",
-        "features": {
-            "transaction_amount": {"factor": 1.15, "noise": 0.1},
-            "credit_limit": {"factor": 8.0, "noise": 2.0},  # MAJOR SPIKE!
-            "distance_from_home_km": {"factor": 2.0, "noise": 0.3},
-            "merchant_category_code": {"shift": 500, "noise": 200},
-        }
-    },
-    "run4": {
-        "description": "High velocity period - Increased transaction frequency",
-        "features": {
-            "transaction_amount": {"factor": 1.4, "noise": 0.2},
-            "velocity_score": {"factor": 2.5, "noise": 0.4},  # SPIKE!
-            "num_transactions_24h": {"shift": 5, "noise": 2},  # SPIKE!
-            "distance_from_home_km": {"factor": 1.5, "noise": 0.2},
-            "max_transaction_amount_30days": {"factor": 1.6, "noise": 0.3},
-        }
-    },
-    "run5": {
-        "description": "Recovery - Returning to normal with residual drift",
-        "features": {
-            "transaction_amount": {"factor": 1.2, "noise": 0.15},
-            "distance_from_home_km": {"factor": 1.3, "noise": 0.2},
-            "velocity_score": {"factor": 1.2, "noise": 0.15},
-        }
-    },
-    "run6": {
-        "description": "Account age anomaly - New user cohort or system change",
-        "features": {
-            "transaction_amount": {"factor": 1.1, "noise": 0.1},
-            "account_age_days": {"factor": 0.3, "noise": 0.1},  # Younger accounts
-            "distance_from_home_km": {"factor": 1.4, "noise": 0.2},
-            "customer_tenure_days": {"factor": 0.4, "noise": 0.15},
-        }
-    },
+DRIFT_PATTERNS = {}
+
+# Add default descriptions for each run
+_RUN_DESCRIPTIONS = {
+    "run1": "Baseline - Minimal drift (normal operations)",
+    "run2": "Distance spike - Remote/travel transactions increase",
+    "run3": "Credit limit anomaly - System changes or data quality issue",
+    "run4": "High velocity period - Increased transaction frequency",
+    "run5": "Recovery - Returning to normal with residual drift",
+    "run6": "Account age anomaly - New user cohort or system change"
 }
+
+# Build DRIFT_PATTERNS from config
+for run_name, features_config in DRIFT_GEN_VARIABLE_PATTERNS.items():
+    DRIFT_PATTERNS[run_name] = {
+        "description": _RUN_DESCRIPTIONS.get(run_name, f"Drift pattern: {run_name}"),
+        "features": features_config
+    }
 
 
 def apply_drift_with_pattern(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:

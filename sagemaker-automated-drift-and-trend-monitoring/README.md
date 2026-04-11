@@ -1735,6 +1735,130 @@ Replace `GroundTruthSimulator` with actual fraud investigation system that write
 - Investigation team confirmations
 - Merchant alerts
 
+### Drift Data Generation Configuration
+
+All drift generation parameters are centralized in `src/config/config.yaml` under the `drift_generation` section. This eliminates hardcoded values and makes it easy to adjust drift amounts for testing.
+
+**Configuration Location:** `src/config/config.yaml` (lines 241-383)
+
+**Default Drift Dataset (`generate_drift_dataset.py`):**
+```yaml
+drift_generation:
+  default_drift:
+    transaction_amount:
+      type: "multiplicative"
+      factor: 1.4      # 40% increase (simulates inflation)
+      noise: 0.1       # ±10% random variation
+    
+    distance_from_home_km:
+      type: "multiplicative"
+      factor: 2.0      # 100% increase (travel/remote transactions)
+      noise: 0.3       # ±30% random variation
+    
+    velocity_score:
+      type: "multiplicative"
+      factor: 1.5      # 50% increase (more active users)
+      noise: 0.2
+    
+    num_transactions_24h:
+      type: "additive"
+      shift: 3         # Add 3 more transactions on average
+      noise: 1
+    
+    transaction_timestamp:
+      type: "additive"
+      shift: 50000     # Shift time forward
+      noise: 5000
+  
+  # Number of samples and reproducibility
+  num_samples: 5000
+  random_state: 123
+```
+
+**Variable Drift Patterns (`generate_variable_drift_dataset.py`):**
+
+The system supports 6 time-varying drift scenarios for realistic testing:
+
+```yaml
+drift_generation:
+  variable_patterns:
+    run1:  # Baseline - minimal drift
+      transaction_amount: {factor: 1.05, noise: 0.05}
+      distance_from_home_km: {factor: 1.1, noise: 0.1}
+    
+    run2:  # Distance spike - travel surge
+      distance_from_home_km: {factor: 3.5, noise: 0.5}  # 3.5x increase!
+      velocity_score: {factor: 1.3, noise: 0.2}
+    
+    run3:  # Credit limit anomaly - system change
+      credit_limit: {factor: 8.0, noise: 2.0}  # 8x increase! (PSI ~74)
+      merchant_category_code: {shift: 500, noise: 200}
+    
+    run4:  # High velocity period
+      velocity_score: {factor: 2.5, noise: 0.4}
+      num_transactions_24h: {shift: 5, noise: 2}
+    
+    run5:  # Recovery - returning to normal
+      transaction_amount: {factor: 1.2, noise: 0.15}
+    
+    run6:  # Account age anomaly - new user cohort
+      account_age_days: {factor: 0.3, noise: 0.1}  # Younger accounts
+```
+
+**To Adjust Drift Amounts:**
+
+1. **Edit config.yaml:**
+   ```yaml
+   drift_generation:
+     variable_patterns:
+       run3:
+         credit_limit:
+           factor: 1.5  # Reduce from 8.0 to 1.5 (20% drift instead of 800%)
+           noise: 0.2   # Reduce from 2.0 to 0.2
+   ```
+
+2. **Regenerate drifted datasets:**
+   ```bash
+   python src/drift_monitoring/generate_drift_dataset.py
+   python src/drift_monitoring/generate_variable_drift_dataset.py
+   ```
+
+3. **Test the new drift levels** in notebook 2a or via endpoint invocations
+
+**Drift Types:**
+- **Multiplicative:** `new_value = original_value × (factor ± noise × factor)`
+  - Example: `factor: 2.0, noise: 0.3` → value is multiplied by 1.4-2.6x
+- **Additive:** `new_value = original_value + (shift ± noise)`
+  - Example: `shift: 3, noise: 1` → value increased by 2-4
+
+**Time-Based Drift Detection:**
+
+The monitoring system now compares data within configurable time windows:
+
+```yaml
+monitoring:
+  lookback_days: 30                  # Default monitoring window
+  data_drift_lookback_days: 7        # Compare last 7 days for data drift
+  model_drift_lookback_days: 30      # Compare last 30 days for model performance
+  min_samples_for_drift: 100         # Minimum samples required
+```
+
+**Before:** Drift compared all historical inference data (LIMIT 5000)  
+**After:** Drift compares recent inference data (last N days) vs training baseline
+
+This ensures:
+- Fair comparison (recent vs recent data)
+- Consistent time periods
+- No mixing of old and new inference data
+- Configurable via environment variables for Lambda deployments
+
+**Lambda Environment Variables:**
+```python
+# Override config.yaml defaults via environment variables
+DATA_DRIFT_LOOKBACK_DAYS=14     # 2 weeks instead of 7 days
+MODEL_DRIFT_LOOKBACK_DAYS=60    # 2 months instead of 30 days
+```
+
 ### MLflow Run ID Tracking
 
 Each drift monitoring execution creates a unique MLflow run with a UUID for complete traceability.

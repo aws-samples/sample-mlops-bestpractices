@@ -5,6 +5,16 @@ Triggered by EventBridge on a schedule (e.g., daily).
 Uses Evidently for data drift and model performance analysis.
 Sends SNS alerts if thresholds exceeded.
 Logs all metrics and Evidently HTML reports to MLflow for tracking.
+
+Configuration via environment variables:
+- DATA_DRIFT_LOOKBACK_DAYS: Days of inference data for data drift (default: 7)
+- MODEL_DRIFT_LOOKBACK_DAYS: Days of inference data for model drift (default: 30)
+- DATA_DRIFT_THRESHOLD: PSI threshold for data drift alerts (default: 0.2)
+- MODEL_DRIFT_THRESHOLD: Performance degradation threshold (default: 0.05)
+- MIN_SAMPLES: Minimum samples required for analysis (default: 100)
+
+Time-based drift detection ensures fair comparison by using recent inference
+data within a configurable time window, rather than all historical data.
 """
 
 import json
@@ -46,6 +56,10 @@ DATA_DRIFT_THRESHOLD = float(os.getenv('DATA_DRIFT_THRESHOLD', '0.2'))  # PSI th
 KS_PVALUE_THRESHOLD = float(os.getenv('KS_PVALUE_THRESHOLD', '0.05'))  # KS p-value threshold
 MODEL_DRIFT_THRESHOLD = float(os.getenv('MODEL_DRIFT_THRESHOLD', '0.05'))  # 5% degradation
 MIN_SAMPLES = int(os.getenv('MIN_SAMPLES', '100'))  # Minimum samples for analysis
+
+# Lookback periods (from config or environment)
+DATA_DRIFT_LOOKBACK_DAYS = int(os.getenv('DATA_DRIFT_LOOKBACK_DAYS', '7'))  # Days of data for drift comparison
+MODEL_DRIFT_LOOKBACK_DAYS = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '30'))  # Days of data for model performance
 
 # Training features (30 features)
 TRAINING_FEATURES = [
@@ -197,14 +211,15 @@ def check_data_drift():
     """
     print("🔍 Checking data drift (Evidently)...")
 
-    # Get recent inference data (last 24 hours)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+    # Get recent inference data (using configured lookback period)
+    lookback_start = (datetime.now() - timedelta(days=DATA_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"  Querying inference data from last {DATA_DRIFT_LOOKBACK_DAYS} days (since {lookback_start})")
 
     recent_data_sql = f"""
     SELECT input_features
     FROM {ATHENA_DATABASE}.inference_responses
-    WHERE request_timestamp >= TIMESTAMP '{yesterday}'
-    LIMIT 5000
+    WHERE request_timestamp >= TIMESTAMP '{lookback_start}'
+    LIMIT 10000
     """
 
     recent_data = execute_athena_query(recent_data_sql)
@@ -319,8 +334,9 @@ def check_model_drift():
     """
     print("🔍 Checking model drift (Evidently)...")
 
-    # Get recent predictions with ground truth (last 7 days)
-    week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    # Get recent predictions with ground truth (using configured lookback period)
+    lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"  Querying predictions with ground truth from last {MODEL_DRIFT_LOOKBACK_DAYS} days (since {lookback_start})")
 
     performance_sql = f"""
     SELECT
@@ -329,8 +345,8 @@ def check_model_drift():
         ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
-      AND request_timestamp >= TIMESTAMP '{week_ago}'
-    LIMIT 5000
+      AND request_timestamp >= TIMESTAMP '{lookback_start}'
+    LIMIT 10000
     """
 
     recent_performance = execute_athena_query(performance_sql)
@@ -379,9 +395,9 @@ def check_model_drift():
     SELECT prediction, probability_fraud, ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
-      AND request_timestamp < TIMESTAMP '{week_ago}'
+      AND request_timestamp < TIMESTAMP '{lookback_start}'
     ORDER BY RANDOM()
-    LIMIT 5000
+    LIMIT 10000
     """
 
     try:

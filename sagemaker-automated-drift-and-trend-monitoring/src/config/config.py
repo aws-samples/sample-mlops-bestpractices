@@ -417,6 +417,33 @@ MONITORING_SCHEDULE_EXPRESSION: str = _get(
 MONITORING_LOOKBACK_DAYS: int = int(
     _get("monitoring", "lookback_days", "MONITORING_LOOKBACK_DAYS", "30")
 )
+MONITORING_DATA_DRIFT_LOOKBACK_DAYS: int = int(
+    _get("monitoring", "data_drift_lookback_days", "MONITORING_DATA_DRIFT_LOOKBACK_DAYS", "7")
+)
+MONITORING_MODEL_DRIFT_LOOKBACK_DAYS: int = int(
+    _get("monitoring", "model_drift_lookback_days", "MONITORING_MODEL_DRIFT_LOOKBACK_DAYS", "30")
+)
+MONITORING_MIN_SAMPLES_FOR_DRIFT: int = int(
+    _get("monitoring", "min_samples_for_drift", "MONITORING_MIN_SAMPLES_FOR_DRIFT", "100")
+)
+
+# ===================================================================
+# Drift Generation Configuration
+# ===================================================================
+_drift_gen_cfg = _yaml_cfg.get("drift_generation", {}) if isinstance(
+    _yaml_cfg.get("drift_generation"), dict
+) else {}
+
+# Default drift configuration
+DRIFT_GEN_DEFAULT_CONFIG: dict = _drift_gen_cfg.get("default_drift", {})
+
+# Variable drift patterns (run1-run6)
+DRIFT_GEN_VARIABLE_PATTERNS: dict = _drift_gen_cfg.get("variable_patterns", {})
+
+# Generation parameters
+DRIFT_GEN_NUM_SAMPLES: int = int(_drift_gen_cfg.get("num_samples", "5000"))
+DRIFT_GEN_NUM_SAMPLES_PER_RUN: int = int(_drift_gen_cfg.get("num_samples_per_run", "2000"))
+DRIFT_GEN_RANDOM_STATE: int = int(_drift_gen_cfg.get("random_state", "123"))
 
 # ===================================================================
 # QuickSight Governance Dashboard

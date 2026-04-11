@@ -47,6 +47,9 @@ ENV/
 *.swo
 *~
 
+# Documents
+*.docx
+
 # OS
 .DS_Store
 Thumbs.db
@@ -56,3 +59,6 @@ sagemaker-automated-drift-and-trend-monitoring/docs/icons/
 
 # Claude-generated guides
 sagemaker-automated-drift-and-trend-monitoring/docs/guides/claude/
+
+# Bandit security scan output
+sagemaker-automated-drift-and-trend-monitoring/bandit.log

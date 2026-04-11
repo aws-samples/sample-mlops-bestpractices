@@ -3,6 +3,17 @@ Generate a drifted dataset for testing inference monitoring.
 
 This script creates a new dataset with intentional feature drift to test
 the MLflow inference monitoring system's ability to detect distribution changes.
+
+All drift parameters (factor, noise, shift) are read from src/config/config.yaml
+under the 'drift_generation.default_drift' section. No values are hardcoded.
+
+To adjust drift amounts:
+1. Edit src/config/config.yaml
+2. Run this script to regenerate the drifted CSV
+3. Test with the new drift levels
+
+Example:
+    python src/drift_monitoring/generate_drift_dataset.py
 """
 
 import pandas as pd
@@ -13,47 +24,36 @@ from pathlib import Path
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.config.config import CSV_TRAINING_DATA, CSV_DRIFTED_DATA
+from src.config.config import (
+    CSV_TRAINING_DATA,
+    CSV_DRIFTED_DATA,
+    DRIFT_GEN_DEFAULT_CONFIG,
+    DRIFT_GEN_NUM_SAMPLES,
+    DRIFT_GEN_RANDOM_STATE,
+)
 
-# Configuration
+# Configuration (now read from config.yaml)
 ORIGINAL_DATA_PATH = CSV_TRAINING_DATA
 DRIFTED_DATA_PATH = CSV_DRIFTED_DATA
-NUM_SAMPLES = 5000
-RANDOM_STATE = 123
+NUM_SAMPLES = DRIFT_GEN_NUM_SAMPLES
+RANDOM_STATE = DRIFT_GEN_RANDOM_STATE
 
-# Drift parameters for key features
-DRIFT_CONFIG = {
-    "transaction_amount": {
-        "type": "multiplicative",
-        "factor": 1.4,  # 40% increase
-        "noise": 0.1,   # 10% random variation
-        "description": "Increased transaction amounts (inflation/behavior change)"
-    },
-    "transaction_timestamp": {
-        "type": "additive",
-        "shift": 50000,  # Shift time forward
-        "noise": 5000,
-        "description": "Time shift to simulate future period"
-    },
-    "distance_from_home_km": {
-        "type": "multiplicative",
-        "factor": 2.0,   # 100% increase (double distance)
-        "noise": 0.3,
-        "description": "Increased distance from home (travel/remote transactions)"
-    },
-    "velocity_score": {
-        "type": "multiplicative",
-        "factor": 1.5,   # 50% increase
-        "noise": 0.2,
-        "description": "Higher transaction velocity (more active users)"
-    },
-    "num_transactions_24h": {
-        "type": "additive",
-        "shift": 3,      # Add 3 more transactions on average
-        "noise": 1,
-        "description": "More transactions per day"
-    },
+# Drift parameters for key features (now read from config.yaml drift_generation.default_drift)
+DRIFT_CONFIG = DRIFT_GEN_DEFAULT_CONFIG
+
+# Add default descriptions if not in config
+_FEATURE_DESCRIPTIONS = {
+    "transaction_amount": "Increased transaction amounts (inflation/behavior change)",
+    "transaction_timestamp": "Time shift to simulate future period",
+    "distance_from_home_km": "Increased distance from home (travel/remote transactions)",
+    "velocity_score": "Higher transaction velocity (more active users)",
+    "num_transactions_24h": "More transactions per day"
 }
+
+# Add descriptions to config entries if missing
+for feature, desc in _FEATURE_DESCRIPTIONS.items():
+    if feature in DRIFT_CONFIG and "description" not in DRIFT_CONFIG[feature]:
+        DRIFT_CONFIG[feature]["description"] = desc
 
 
 def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
@@ -64,9 +64,21 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
 
     original_values = df[feature].values
 
-    if config["type"] == "multiplicative":
+    drift_type = config.get("type", "")
+
+    # Determine drift type from config keys if not explicitly set
+    if not drift_type:
+        if "factor" in config:
+            drift_type = "multiplicative"
+        elif "shift" in config:
+            drift_type = "additive"
+        else:
+            print(f"  Warning: No drift type or factor/shift found for {feature}, skipping")
+            return df
+
+    if drift_type == "multiplicative":
         # Multiplicative drift: value = original * (factor ± noise)
-        factor = config["factor"]
+        factor = config.get("factor", 1.0)
         noise = config.get("noise", 0)
         random_factors = np.random.uniform(
             factor - noise * factor,
@@ -75,9 +87,9 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
         )
         drifted_values = original_values * random_factors
 
-    elif config["type"] == "additive":
+    elif drift_type == "additive":
         # Additive drift: value = original + (shift ± noise)
-        shift = config["shift"]
+        shift = config.get("shift", 0)
         noise = config.get("noise", 0)
         random_shifts = np.random.uniform(
             shift - noise,
@@ -87,7 +99,7 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
         drifted_values = original_values + random_shifts
 
     else:
-        raise ValueError(f"Unknown drift type: {config['type']}")
+        raise ValueError(f"Unknown drift type: {drift_type}")
 
     # Ensure non-negative values for certain features
     if feature in ["transaction_amount", "distance_from_home_km", "velocity_score", "num_transactions_24h"]:
@@ -102,13 +114,14 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
     # Print drift statistics
     original_mean = original_values.mean()
     drifted_mean = drifted_values.mean()
-    pct_change = ((drifted_mean - original_mean) / original_mean) * 100
+    pct_change = ((drifted_mean - original_mean) / original_mean) * 100 if original_mean != 0 else 0
 
     print(f"  {feature}:")
     print(f"    Original mean: {original_mean:.4f}")
     print(f"    Drifted mean: {drifted_mean:.4f}")
     print(f"    Change: {pct_change:+.2f}%")
-    print(f"    Description: {config['description']}")
+    if "description" in config:
+        print(f"    Description: {config['description']}")
 
     return df
 
