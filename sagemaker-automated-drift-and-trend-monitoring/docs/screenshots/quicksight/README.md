@@ -561,7 +561,7 @@ PSI = Σ (Actual% - Expected%) × ln(Actual% / Expected%)
 
 **Total PSI = 0.208 + 0.515 + 0.138 + 0.007 + 1.788 = 2.656**
 
-(Note: Your actual PSI of 74.47 suggests even more extreme shifts or normalized differently by Evidently)
+(Note: Your actual PSI of 74.47 comes from the intentional 8x credit_limit spike in the test data - configurable via `src/config/config.yaml` → `drift_generation.variable_patterns.run3.credit_limit.factor`)
 
 **Interpretation:**
 - PSI < 0.10: No significant change

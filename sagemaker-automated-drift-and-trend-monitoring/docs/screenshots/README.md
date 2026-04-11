@@ -50,6 +50,10 @@ cp /path/to/screenshot.png docs/screenshots/DirectTestingInSGPlayground-custom-h
 grep -r "DirectTestingInSGPlayground-custom-handler.png" .
 ```
 
+## Evidently Interactive Reports
+
+**Note**: Notebooks in `2a_inference_monitoring.ipynb` contain embedded Evidently HTML reports. These work when running notebooks locally but don't render on GitHub (security limitation). See [evidently/](evidently/) folder for example screenshots.
+
 ## Notes
 
 - Use PNG format for better quality
@@ -57,3 +61,4 @@ grep -r "DirectTestingInSGPlayground-custom-handler.png" .
 - Blur any sensitive information (account IDs, bucket names)
 - Include browser/UI chrome to show context
 - Screenshots should match the documented workflow
+- For Evidently reports, capture the full interactive UI with multiple tabs visible
