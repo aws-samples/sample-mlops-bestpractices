@@ -1,6 +1,6 @@
 evidently>=0.4.22,<1
-pandas<3
-numpy<2
-scipy<2
-scikit-learn<2
+pandas>=2.0,<3
+numpy>=1.26,<1.27
+scipy>=1.11,<1.14
+scikit-learn>=1.3,<2
 boto3
