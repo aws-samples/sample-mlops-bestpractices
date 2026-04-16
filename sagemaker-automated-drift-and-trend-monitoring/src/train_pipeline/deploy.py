@@ -33,28 +33,10 @@ except ImportError:
 import mlflow
 
 # Import SageMaker components
-try:
-    from sagemaker.serverless import ServerlessInferenceConfig
-except ImportError:
-    try:
-        from sagemaker.core.inference_config import ServerlessInferenceConfig
-    except ImportError:
-        raise ImportError(
-            "Could not import ServerlessInferenceConfig. "
-            "Please ensure sagemaker SDK version 2.x is installed: "
-            "pip install 'sagemaker>=2.210.0,<3.0.0'"
-        )
+from sagemaker.serve.serverless import ServerlessInferenceConfig
 
-try:
-    from sagemaker.xgboost import XGBoostModel
-    from sagemaker import image_uris
-    from sagemaker.predictor import Predictor
-except ImportError as e:
-    raise ImportError(
-        f"Could not import SageMaker v2.x modules: {e}\n"
-        "Please install the correct SageMaker SDK version: "
-        "pip install 'sagemaker>=2.210.0,<3.0.0'"
-    )
+from sagemaker.serve.model_builder import ModelBuilder, SourceCode
+from sagemaker.core.image_uris import retrieve as retrieve_image_uri
 
 from src.config.config import (
     MLFLOW_MODEL_NAME,
@@ -83,7 +65,7 @@ def deploy(
     memory_size_mb: Optional[int] = None,
     max_concurrency: Optional[int] = None,
     enable_athena_logging: Optional[bool] = None,
-) -> Predictor:
+):
     """
     Deploy MLflow model to SageMaker with enhanced Athena logging.
 
@@ -97,7 +79,7 @@ def deploy(
         enable_athena_logging: Enable Athena logging (defaults to config)
 
     Returns:
-        SageMaker Predictor for the deployed endpoint
+        SageMaker Endpoint for the deployed model
     """
     # Use defaults from config if not provided
     model_name = model_name or MLFLOW_MODEL_NAME
@@ -253,9 +235,12 @@ def deploy(
         )
         print(f"Model uploaded to: {model_data_s3}")
 
-    # Create XGBoost Model with enhanced inference handler
-    print("\nCreating SageMaker XGBoost model with enhanced inference handler...")
+    # Create Model with enhanced inference handler
+    print("\nCreating SageMaker model with enhanced inference handler...")
     inference_script_path = Path(__file__).parent.parent / "deployment" / "inference_handler.py"
+
+    # Determine region from the sagemaker_session
+    region = sagemaker_session.boto_session.region_name
 
     # Environment variables for inference logging
     environment = {
@@ -276,14 +261,20 @@ def deploy(
     for key, value in environment.items():
         print(f"  {key}: {value}")
 
-    xgb_model = XGBoostModel(
-        model_data=model_data_s3,
-        role=role,
-        entry_point=str(inference_script_path),
-        framework_version="1.7-1",
-        py_version="py3",
+    model_builder = ModelBuilder(
+        image_uri=retrieve_image_uri(
+            framework="xgboost",
+            region=region,
+            version="1.7-1",
+        ),
+        s3_model_data_url=model_data_s3,
+        role_arn=role,
+        source_code=SourceCode(
+            source_dir=str(inference_script_path.parent),
+            entry_script=inference_script_path.name,
+        ),
         sagemaker_session=sagemaker_session,
-        env=environment,
+        env_vars=environment,
     )
 
     # Configure serverless inference
@@ -330,9 +321,9 @@ def deploy(
     print(f"\nDeploying to endpoint: {endpoint_name}")
     print("This may take several minutes...")
 
-    predictor = xgb_model.deploy(
+    endpoint = model_builder.deploy(
         endpoint_name=endpoint_name,
-        serverless_inference_config=serverless_config,
+        inference_config=serverless_config,
     )
 
     print("\n" + "=" * 80)
@@ -345,7 +336,7 @@ def deploy(
     print(f"\nTo test the endpoint:")
     print(f"  python -m src.train_pipeline.test_endpoint --endpoint-name {endpoint_name}")
 
-    return predictor
+    return endpoint
 
 
 if __name__ == "__main__":
@@ -363,7 +354,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Deploy
-    predictor = deploy(
+    endpoint = deploy(
         run_id=args.run_id,
         endpoint_name=args.endpoint_name,
         model_version=args.model_version,

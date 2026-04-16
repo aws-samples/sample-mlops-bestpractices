@@ -25,36 +25,57 @@ import os
 from typing import Dict, Any, Optional, List
 
 import boto3
-import sagemaker
-from sagemaker import get_execution_role
-from sagemaker.processing import (
+
+# SageMaker v3 imports — Session and role helpers
+from sagemaker.core.helper.session_helper import Session, get_execution_role
+from sagemaker.core.workflow.pipeline_context import PipelineSession
+
+# Processing
+from sagemaker.core.processing import (
     ProcessingInput, ProcessingOutput, ScriptProcessor, FrameworkProcessor
 )
-from sagemaker.sklearn.processing import SKLearnProcessor
-from sagemaker.spark.processing import PySparkProcessor
-from sagemaker.estimator import Estimator
-from sagemaker.xgboost.estimator import XGBoost
-from sagemaker.inputs import TrainingInput
-from sagemaker.model_metrics import MetricsSource, ModelMetrics
-from sagemaker.workflow.parameters import (
+from sagemaker.core.shapes.shapes import ProcessingS3Output, ProcessingS3Input
+from sagemaker.core.spark.processing import PySparkProcessor
+
+# Training (ModelTrainer replaces XGBoost estimator)
+from sagemaker.train.model_trainer import ModelTrainer, SourceCode, Compute, InputData
+from sagemaker.core.shapes.shapes import OutputDataConfig
+
+# Inputs
+from sagemaker.core.inputs import TrainingInput, CreateModelInput
+
+# Model (ModelBuilder replaces the old sagemaker.model.Model in v3)
+from sagemaker.serve.model_builder import ModelBuilder
+from sagemaker.core.model_metrics import MetricsSource, ModelMetrics
+
+# Workflow parameters
+from sagemaker.core.workflow.parameters import (
     ParameterInteger, ParameterString, ParameterFloat, ParameterBoolean
 )
-from sagemaker.workflow.pipeline import Pipeline
-from sagemaker.workflow.steps import (
-    ProcessingStep, TrainingStep, CreateModelStep, TransformStep
-)
-from sagemaker.workflow.step_collections import RegisterModel
-from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
-from sagemaker.workflow.condition_step import ConditionStep
-from sagemaker.workflow.functions import JsonGet, Join
-from sagemaker.workflow.properties import PropertyFile
-from sagemaker.workflow.lambda_step import LambdaStep, LambdaOutput, LambdaOutputTypeEnum
-from sagemaker.lambda_helper import Lambda
-from sagemaker.model import Model
-from sagemaker.xgboost import XGBoostModel
-from sagemaker.transformer import Transformer
-from sagemaker.workflow.fail_step import FailStep
-from sagemaker.workflow.execution_variables import ExecutionVariables
+
+# Pipeline and steps
+from sagemaker.mlops.workflow.pipeline import Pipeline
+from sagemaker.mlops.workflow.steps import ProcessingStep, TrainingStep, TransformStep
+from sagemaker.mlops.workflow.model_step import ModelStep
+from sagemaker.mlops.workflow.condition_step import ConditionStep
+from sagemaker.mlops.workflow.lambda_step import LambdaStep, LambdaOutput, LambdaOutputTypeEnum
+from sagemaker.mlops.workflow.fail_step import FailStep
+
+# Workflow utilities
+from sagemaker.core.workflow.conditions import ConditionGreaterThanOrEqualTo
+from sagemaker.core.workflow.functions import JsonGet, Join
+from sagemaker.core.workflow.properties import PropertyFile
+from sagemaker.core.workflow.execution_variables import ExecutionVariables
+
+# Lambda helper
+from sagemaker.core.lambda_helper import Lambda
+
+# Infrastructure
+from sagemaker.core.transformer import Transformer
+from sagemaker.core.image_uris import retrieve as retrieve_image_uri
+
+# Serverless
+from sagemaker.serve.serverless import ServerlessInferenceConfig
 
 # Local imports
 import sys
@@ -142,8 +163,10 @@ class FraudDetectionPipeline:
                     "Please provide role ARN or set SAGEMAKER_EXEC_ROLE"
                 )
 
-        # Initialize SageMaker session
-        self.session = sagemaker.Session(boto_session=boto3.Session(region_name=region))
+        # Initialize SageMaker PipelineSession — required for v3 so that
+        # processor.run(), model_trainer.train(), model_builder.register/build()
+        # return step_args instead of executing jobs immediately.
+        self.session = PipelineSession(boto_session=boto3.Session(region_name=region))
         self.bucket = self.session.default_bucket()
         self.account_id = boto3.client('sts').get_caller_identity()['Account']
 
@@ -304,29 +327,40 @@ class FraudDetectionPipeline:
             "--target-column", params['target_column'],
         ]
 
-        # Processing step with PySpark script
+        # Processing step with PySpark script — v3 uses step_args from processor.run()
         step = ProcessingStep(
             name="PreprocessData",
-            processor=processor,
-            code=str(Path(__file__).parent / "pipeline_steps" / "preprocessing_pyspark.py"),
-            job_arguments=job_arguments,
-            outputs=[
-                ProcessingOutput(
-                    output_name="train",
-                    source="/opt/ml/processing/output/train",
-                    destination=f"s3://{self.bucket}/fraud-detection/preprocessing/train"
-                ),
-                ProcessingOutput(
-                    output_name="test",
-                    source="/opt/ml/processing/output/test",
-                    destination=f"s3://{self.bucket}/fraud-detection/preprocessing/test"
-                ),
-                ProcessingOutput(
-                    output_name="stats",
-                    source="/opt/ml/processing/output/stats",
-                    destination=f"s3://{self.bucket}/fraud-detection/preprocessing/stats"
-                )
-            ],
+            step_args=processor.run(
+                submit_app=str(Path(__file__).parent / "pipeline_steps" / "preprocessing_pyspark.py"),
+                arguments=job_arguments,
+                outputs=[
+                    ProcessingOutput(
+                        output_name="train",
+                        s3_output=ProcessingS3Output(
+                            local_path="/opt/ml/processing/output/train",
+                            s3_uri=f"s3://{self.bucket}/fraud-detection/preprocessing/train",
+                            s3_upload_mode="EndOfJob",
+                        ),
+                    ),
+                    ProcessingOutput(
+                        output_name="test",
+                        s3_output=ProcessingS3Output(
+                            local_path="/opt/ml/processing/output/test",
+                            s3_uri=f"s3://{self.bucket}/fraud-detection/preprocessing/test",
+                            s3_upload_mode="EndOfJob",
+                        ),
+                    ),
+                    ProcessingOutput(
+                        output_name="stats",
+                        s3_output=ProcessingS3Output(
+                            local_path="/opt/ml/processing/output/stats",
+                            s3_uri=f"s3://{self.bucket}/fraud-detection/preprocessing/stats",
+                            s3_upload_mode="EndOfJob",
+                        ),
+                    ),
+                ],
+                wait=False,
+            ),
         )
 
         logger.info("✓ PySpark preprocessing step created")
@@ -343,6 +377,10 @@ class FraudDetectionPipeline:
         """
         Create training step with MLflow integration.
 
+        Uses ModelTrainer (v3) instead of XGBoost estimator (v2).
+        The ModelTrainer is configured with an explicit XGBoost training image,
+        SourceCode for the training script, and Compute for instance config.
+
         Args:
             params: Pipeline parameters
             preprocessing_step: Preprocessing step for input dependencies
@@ -352,24 +390,44 @@ class FraudDetectionPipeline:
         """
         logger.info("Creating training step...")
 
-        # Use XGBoost Framework for script mode with MLflow support
-        # MLflow is auto-installed in train.py if not present
-        estimator = XGBoost(
-            entry_point='train.py',
+        # Retrieve XGBoost training image URI for the target region
+        xgboost_image = retrieve_image_uri(
+            framework="xgboost",
+            region=self.region,
+            version=self.config['xgboost_version']
+        )
+
+        # Source code configuration for the training script
+        source_code = SourceCode(
             source_dir=str(Path(__file__).parent / "pipeline_steps"),
-            framework_version=self.config['xgboost_version'],
-            py_version='py3',
-            role=self.role,
-            instance_count=1,
+            entry_script="train.py",
+        )
+
+        # Compute configuration for training instances
+        compute = Compute(
             instance_type=params['training_instance_type'],
-            output_path=f"s3://{self.bucket}/fraud-detection/training/output",
+            instance_count=1,
+        )
+
+        # ModelTrainer replaces XGBoost estimator in v3
+        # MLflow is auto-installed in train.py if not present
+        model_trainer = ModelTrainer(
+            training_image=xgboost_image,
+            source_code=source_code,
+            compute=compute,
+            role=self.role,
             base_job_name="fraud-training",
+            output_data_config=OutputDataConfig(
+                s3_output_path=f"s3://{self.bucket}/fraud-detection/training/output"
+            ),
             sagemaker_session=self.session,
             hyperparameters={
-                # Training script hyperparameters (passed as args)
-                'max-depth': params['max_depth'],
-                'learning-rate': params['learning_rate'],
-                'num-boost-round': params['num_boost_round'],
+                # Training script hyperparameters — must be strings for SageMaker API.
+                # Pipeline parameters (ParameterInteger/Float) are wrapped with Join()
+                # to convert them to their string representation at execution time.
+                'max-depth': Join(on="", values=[params['max_depth']]),
+                'learning-rate': Join(on="", values=[params['learning_rate']]),
+                'num-boost-round': Join(on="", values=[params['num_boost_round']]),
                 'target-column': 'is_fraud',
             },
             environment={
@@ -377,23 +435,25 @@ class FraudDetectionPipeline:
                 'MLFLOW_TRACKING_URI': MLFLOW_TRACKING_URI if MLFLOW_TRACKING_URI else '',
                 'MLFLOW_EXPERIMENT_NAME': 'credit-card-fraud-detection-training',
                 'MLFLOW_MODEL_NAME': MLFLOW_MODEL_NAME,
-            }
+            },
         )
 
-        # Training step
+        # S3 URIs for training data from preprocessing step outputs
+        train_s3_uri = preprocessing_step.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri
+        validation_s3_uri = preprocessing_step.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri
+
+        # Training step using step_args from model_trainer.train() (v3 pattern)
+        # In pipeline context, .train(wait=False) returns step arguments
+        # instead of executing the job directly
         step = TrainingStep(
             name="TrainModel",
-            estimator=estimator,
-            inputs={
-                "train": TrainingInput(
-                    s3_data=preprocessing_step.properties.ProcessingOutputConfig.Outputs["train"].S3Output.S3Uri,
-                    content_type="text/csv"
-                ),
-                "validation": TrainingInput(
-                    s3_data=preprocessing_step.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri,
-                    content_type="text/csv"
-                )
-            },
+            step_args=model_trainer.train(
+                input_data_config=[
+                    InputData(channel_name="train", data_source=train_s3_uri),
+                    InputData(channel_name="validation", data_source=validation_s3_uri),
+                ],
+                wait=False,
+            ),
         )
 
         logger.info("✓ Training step created")
@@ -419,7 +479,7 @@ class FraudDetectionPipeline:
         logger.info("Creating evaluation step...")
 
         # Use ScriptProcessor with XGBoost image (has xgboost pre-installed)
-        xgboost_image = sagemaker.image_uris.retrieve(
+        xgboost_image = retrieve_image_uri(
             framework="xgboost",
             region=self.region,
             version=self.config['xgboost_version']
@@ -449,30 +509,43 @@ class FraudDetectionPipeline:
 
         step = ProcessingStep(
             name="EvaluateModel",
-            processor=processor,
-            code=str(Path(__file__).parent / "pipeline_steps" / "evaluation.py"),
-            job_arguments=[
-                "--target-column", params['target_column'],
-                "--min-roc-auc", Join(on="", values=[params['min_roc_auc']]),
-                "--min-pr-auc", Join(on="", values=[params['min_pr_auc']]),
-            ],
-            inputs=[
-                ProcessingInput(
-                    source=training_step.properties.ModelArtifacts.S3ModelArtifacts,
-                    destination="/opt/ml/processing/model"
-                ),
-                ProcessingInput(
-                    source=preprocessing_step.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri,
-                    destination="/opt/ml/processing/test"
-                )
-            ],
-            outputs=[
-                ProcessingOutput(
-                    output_name="evaluation",
-                    source="/opt/ml/processing/evaluation",
-                    destination=f"s3://{self.bucket}/fraud-detection/evaluation"
-                )
-            ],
+            step_args=processor.run(
+                code=str(Path(__file__).parent / "pipeline_steps" / "evaluation.py"),
+                arguments=[
+                    "--target-column", params['target_column'],
+                    "--min-roc-auc", Join(on="", values=[params['min_roc_auc']]),
+                    "--min-pr-auc", Join(on="", values=[params['min_pr_auc']]),
+                ],
+                inputs=[
+                    ProcessingInput(
+                        input_name="model",
+                        s3_input=ProcessingS3Input(
+                            s3_uri=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+                            s3_data_type="S3Prefix",
+                            local_path="/opt/ml/processing/model",
+                        ),
+                    ),
+                    ProcessingInput(
+                        input_name="test",
+                        s3_input=ProcessingS3Input(
+                            s3_uri=preprocessing_step.properties.ProcessingOutputConfig.Outputs["test"].S3Output.S3Uri,
+                            s3_data_type="S3Prefix",
+                            local_path="/opt/ml/processing/test",
+                        ),
+                    ),
+                ],
+                outputs=[
+                    ProcessingOutput(
+                        output_name="evaluation",
+                        s3_output=ProcessingS3Output(
+                            local_path="/opt/ml/processing/evaluation",
+                            s3_uri=f"s3://{self.bucket}/fraud-detection/evaluation",
+                            s3_upload_mode="EndOfJob",
+                        ),
+                    ),
+                ],
+                wait=False,
+            ),
             property_files=[evaluation_report],
         )
 
@@ -484,9 +557,14 @@ class FraudDetectionPipeline:
         params: Dict[str, Any],
         training_step: TrainingStep,
         evaluation_step: ProcessingStep
-    ) -> RegisterModel:
+    ) -> ModelStep:
         """
         Create model registration step.
+
+        Uses ModelStep wrapping Model.register() (v3) instead of the removed
+        RegisterModel step collection (v2). A Model object is created explicitly
+        with the XGBoost image URI and training artifacts, then model.register()
+        is called in pipeline context to produce step_args.
 
         Args:
             params: Pipeline parameters
@@ -494,7 +572,7 @@ class FraudDetectionPipeline:
             evaluation_step: Evaluation step for metrics
 
         Returns:
-            RegisterModel step
+            ModelStep for model registration
         """
         logger.info("Creating register model step...")
 
@@ -511,17 +589,33 @@ class FraudDetectionPipeline:
             )
         )
 
-        step = RegisterModel(
+        # Retrieve XGBoost image URI for the model
+        xgboost_image = retrieve_image_uri(
+            framework="xgboost",
+            region=self.region,
+            version=self.config['xgboost_version']
+        )
+
+        # Create ModelBuilder with training artifacts (v3 pattern)
+        model_builder = ModelBuilder(
+            image_uri=xgboost_image,
+            s3_model_data_url=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+            role_arn=self.role,
+            sagemaker_session=self.session,
+        )
+
+        # ModelStep wraps model_builder.register() to produce a pipeline step
+        step = ModelStep(
             name="RegisterModel",
-            estimator=training_step.estimator,
-            model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
-            content_types=["application/json", "text/csv"],
-            response_types=["application/json"],
-            inference_instances=["ml.m5.xlarge", "ml.m5.large"],
-            transform_instances=["ml.m5.xlarge"],
-            model_package_group_name=params['model_package_group'],
-            approval_status=params['model_approval_status'],
-            model_metrics=model_metrics,
+            step_args=model_builder.register(
+                content_types=["application/json", "text/csv"],
+                response_types=["application/json"],
+                inference_instances=["ml.m5.xlarge", "ml.m5.large"],
+                transform_instances=["ml.m5.xlarge"],
+                model_package_group_name=params['model_package_group'],
+                approval_status=params['model_approval_status'],
+                model_metrics=model_metrics,
+            ),
         )
 
         logger.info("✓ Register model step created")
@@ -531,66 +625,42 @@ class FraudDetectionPipeline:
         self,
         params: Dict[str, Any],
         training_step: TrainingStep
-    ) -> CreateModelStep:
+    ) -> ModelStep:
         """
         Create SageMaker model step with custom inference handler for Athena logging.
+
+        Uses ModelStep wrapping Model.create() (v3) instead of the removed
+        CreateModelStep (v2). A generic Model object is created with an explicit
+        XGBoost image URI, the custom inference script, and environment variables
+        for Athena logging and MLflow tracking.
 
         Args:
             params: Pipeline parameters
             training_step: Training step for model artifacts
 
         Returns:
-            CreateModelStep
+            ModelStep for model creation
         """
         logger.info("Creating model step with custom inference handler...")
 
-        # Path to custom inference handler (same directory as pipeline)
-        inference_handler_dir = Path(__file__).parent
+        # Retrieve XGBoost image URI for the model
+        xgboost_image = retrieve_image_uri(
+            framework="xgboost",
+            region=self.region,
+            version=self.config['xgboost_version']
+        )
 
-        # Create XGBoostModel with custom inference handler for Athena logging
-        # model = XGBoostModel(
-        #     model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
-        #     role=self.role,
-        #     entry_point="inference_handler.py",  # Custom handler with Athena logging
-        #     source_dir=str(inference_handler_dir),
-        #     framework_version=self.config['xgboost_version'],
-        #     py_version="py3",
-        #     sagemaker_session=self.session,
-        #     env={
-        #         # MLflow tracking
-        #         'MLFLOW_TRACKING_URI': MLFLOW_TRACKING_URI,
-        #         'MLFLOW_MODEL_NAME': MLFLOW_MODEL_NAME,
-
-        #         # Athena logging configuration
-        #         'ENABLE_ATHENA_LOGGING': 'true',
-        #         'ATHENA_DATABASE': ATHENA_DATABASE,
-        #         'ATHENA_OUTPUT_S3': ATHENA_OUTPUT_S3,
-        #         'INFERENCE_LOG_BATCH_SIZE': str(INFERENCE_LOG_BATCH_SIZE),
-        #         'INFERENCE_LOG_FLUSH_INTERVAL': str(INFERENCE_LOG_FLUSH_INTERVAL),
-
-        #         # Endpoint identification (for Athena filtering)
-        #         'ENDPOINT_NAME': 'fraud-detector-endpoint',
-        #         'MODEL_VERSION': 'v1.0',
-        #         'MLFLOW_RUN_ID': 'pipeline',  # Will be set to actual run_id if available
-
-        #         # Confidence thresholds
-        #         'HIGH_CONFIDENCE_THRESHOLD': str(HIGH_CONFIDENCE_THRESHOLD),
-        #         'LOW_CONFIDENCE_LOWER': str(LOW_CONFIDENCE_LOWER),
-        #         'LOW_CONFIDENCE_UPPER': str(LOW_CONFIDENCE_UPPER),
-        #     },
-        #     dependencies=[
-        #         "inference_requirements.txt",  # Required for Athena logging (relative to source_dir)
-        #     ]
-        # )
-        model = XGBoostModel(
-            model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
-            role=self.role,
-            entry_point="inference.py",
-            source_dir=str(Path(__file__).parent / "pipeline_steps"),
-            framework_version=self.config['xgboost_version'],
-            py_version="py3",
+        # Create ModelBuilder with explicit image URI (v3 pattern — replaces XGBoostModel)
+        model_builder = ModelBuilder(
+            image_uri=xgboost_image,
+            s3_model_data_url=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+            role_arn=self.role,
+            source_code=SourceCode(
+                source_dir=str(Path(__file__).parent / "pipeline_steps"),
+                entry_script="inference.py",
+            ),
             sagemaker_session=self.session,
-            env={
+            env_vars={
                 'MLFLOW_TRACKING_URI': MLFLOW_TRACKING_URI if MLFLOW_TRACKING_URI else '',
                 'MLFLOW_MODEL_NAME': MLFLOW_MODEL_NAME,
                 'ENABLE_ATHENA_LOGGING': 'true',
@@ -604,11 +674,12 @@ class FraudDetectionPipeline:
             },
         )
 
-        step = CreateModelStep(
+        # ModelStep wraps model_builder.build() to produce a pipeline step
+        step = ModelStep(
             name="CreateModel",
-            model=model,
-            inputs=sagemaker.inputs.CreateModelInput(
-                instance_type="ml.m5.xlarge"
+            step_args=model_builder.build(
+                sagemaker_session=self.session,
+                role_arn=self.role,
             ),
         )
 
@@ -680,15 +751,16 @@ class FraudDetectionPipeline:
     def _create_deploy_step(
         self,
         params: Dict[str, Any],
-        create_model_step: CreateModelStep,
-        register_step: RegisterModel
+        create_model_step: ModelStep,
+        register_step: ModelStep
     ) -> LambdaStep:
         """
         Create Lambda step for endpoint deployment.
 
         Args:
             params: Pipeline parameters
-            create_model_step: CreateModelStep for model name
+            create_model_step: ModelStep for model name
+            register_step: ModelStep for model package ARN
 
         Returns:
             LambdaStep

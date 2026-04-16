@@ -2,9 +2,8 @@
 
 import os
 import boto3
-import sagemaker
 from botocore.exceptions import ClientError, NoCredentialsError
-from sagemaker import Session
+from sagemaker.core.helper.session_helper import Session
 
 
 def get_sagemaker_session() -> Session:
@@ -20,9 +19,9 @@ def get_sagemaker_session() -> Session:
         if boto_session.region_name is None:
             print("No AWS region configured, using us-east-1 as default")
             boto_session = boto3.Session(region_name='us-east-1')
-        return sagemaker.Session(boto_session=boto_session)
+        return Session(boto_session=boto_session)
 
-    return sagemaker.Session()
+    return Session()
 
 
 def get_execution_role(sagemaker_session: Session = None) -> str:
@@ -49,7 +48,8 @@ def get_execution_role(sagemaker_session: Session = None) -> str:
 
     # Try to get role from SageMaker environment or caller identity
     try:
-        role = sagemaker.get_execution_role(sagemaker_session=sagemaker_session)
+        from sagemaker.core.helper.session_helper import get_execution_role as _get_execution_role
+        role = _get_execution_role(sagemaker_session=sagemaker_session)
         print(f"Using SageMaker execution role: {role}")
         return role
     except ClientError as e:
