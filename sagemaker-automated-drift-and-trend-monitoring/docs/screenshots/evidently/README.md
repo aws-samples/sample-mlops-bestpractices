@@ -1,15 +1,15 @@
 # Evidently Report Screenshots
 
-These are example screenshots showing what Evidently AI drift detection reports look like. When you run `notebooks/2a_inference_monitoring.ipynb` locally, you'll get fully interactive HTML reports with drill-down capabilities.
+Screenshots captured from actual Evidently reports logged to MLflow during drift monitoring runs. The full interactive HTML reports are available as MLflow artifacts under `evidently_reports/`.
 
 ## Data Drift Report
 
-![Data Drift Report Example](data-drift-report-example.png)
+![Data Drift Report](data-drift-report-screenshot.png)
 
-Shows PSI scores per feature, distribution histograms comparing training vs inference data, and drift trends over time.
+Shows per-feature drift detection using Wasserstein distance, with reference vs current distribution comparisons.
 
 ## Classification Performance Report
 
-![Classification Performance Example](classification-performance-example.png)
+![Classification Performance Report](classification-performance-screenshot.png)
 
-Shows confusion matrix, ROC curve, precision-recall curve, and performance metrics over time.
+Shows model quality metrics (accuracy, precision, recall, F1), confusion matrices, and classification quality by label for current vs reference data.

@@ -2550,7 +2550,7 @@ python -m src.monitoring.update_ground_truth --mode batch
 - Per-feature drift scores and classification metrics logged as MLflow metrics
 - Alerts if performance degraded >5%
 
-> **📝 Note:** Evidently reports in cells 33 and 36 show as interactive HTML when running locally, but don't render on GitHub. See [example screenshots](docs/screenshots/evidently/) or check MLflow artifacts in production.
+> **📝 Note:** Evidently reports in cells 33 and 36 show as interactive HTML when running locally, but don't render on GitHub. See [report screenshots](docs/screenshots/evidently/) or check MLflow artifacts under `evidently_reports/` in production.
 
 **Alternative: CLI monitoring (no charts):**
 ```bash
