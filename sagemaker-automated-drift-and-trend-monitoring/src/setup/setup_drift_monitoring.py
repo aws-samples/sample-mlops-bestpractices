@@ -2,6 +2,12 @@
 """
 Setup automated drift monitoring with EventBridge, Lambda, and SNS.
 
+NOTE: This file is NOT currently used as part of the SageMaker pipeline.
+The active deployment path is `scripts/deploy_lambda_container.sh`, which
+packages the drift monitoring Lambda as a container image (see the 2a
+inference monitoring notebook). This file is retained as an alternative
+zip-based deployment option and is not executed by the pipeline today.
+
 This script creates:
 1. SNS topic for drift alerts
 2. Email subscription to SNS topic
@@ -13,6 +19,8 @@ This script creates:
 import boto3
 import json
 import os
+import subprocess
+import sys
 import zipfile
 import time
 from pathlib import Path
@@ -169,10 +177,20 @@ def create_lambda_deployment_package():
     print("  📥 Installing dependencies...")
     requirements_file = project_root / 'src' / 'scripts' / 'lambda_requirements.txt'
     if requirements_file.exists():
-        os.system(f'pip install -q -t {package_dir} -r {requirements_file}')
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-q',
+             '-t', str(package_dir),
+             '-r', str(requirements_file)],
+            check=True,
+        )
     else:
         # Fallback to manual installation
-        os.system(f'pip install -q -t {package_dir} scikit-learn numpy pandas mlflow matplotlib boto3')
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '-q',
+             '-t', str(package_dir),
+             'scikit-learn', 'numpy', 'pandas', 'mlflow', 'matplotlib', 'boto3'],
+            check=True,
+        )
 
     # Copy Lambda code
     import shutil
