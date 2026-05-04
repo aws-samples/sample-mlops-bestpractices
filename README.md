@@ -6,7 +6,7 @@ A collection of production-ready patterns and reference architectures for MLOps 
 
 ### [Automated Drift and Trend Monitoring](sagemaker-automated-drift-and-trend-monitoring/)
 
-An end-to-end MLOps system built on Amazon SageMaker, MLflow, and Evidently AI that trains an XGBoost fraud detection model, logs every prediction to an Athena Iceberg data lake, and runs automated daily drift checks. Includes SNS alerting, ground truth integration, and a QuickSight governance dashboard — all for ~$30/month.
+An end-to-end MLOps system built on Amazon SageMaker, MLflow, and Evidently AI that trains an XGBoost fraud detection model, logs every prediction to an Athena Iceberg data lake, and runs automated daily drift checks. Includes SNS alerting, ground truth integration, and a QuickSight governance dashboard.
 
 Covers: SageMaker Pipelines, MLflow experiment tracking, Evidently drift detection, async inference logging (SQS + Lambda), EventBridge scheduling, QuickSight dashboards.
 
