@@ -60,9 +60,9 @@ A ** Open-source MLOps system** that establishes automated monitoring and govern
 
 ## Architecture Diagram
 
-![MLOps Architecture](docs/guides/architecture_diagram.png)
+![MLOps Architecture](docs/guides/MetaMonitoring.png)
 
-> To regenerate: `python docs/generate_architecture_diagram.py` (requires `pip install diagrams`, `brew install graphviz`, and AWS icons in `docs/icons/` — see [Diagram Generation](#diagram-generation))
+> **11-Step End-to-End Flow**: This architecture shows the complete MLOps pipeline from data ingestion through training, deployment, inference monitoring, and governance. See [ARCHITECTURE_STEPS.md](docs/ARCHITECTURE_STEPS.md) for detailed descriptions of each numbered step.
 
 The diagram above shows the complete MLOps architecture including:
 - **Training Pipeline** (top): Orchestrated by `1_training_pipeline.ipynb`, includes preprocessing, training, deployment, and inference with SQS logging
@@ -70,11 +70,11 @@ The diagram above shows the complete MLOps architecture including:
 - **Monitoring Infrastructure** (bottom): Orchestrated by `2a_inference_monitoring.ipynb`, includes manual drift analysis and automated monitoring with EventBridge, Lambda, and SNS alerts
 - **MLflow Integration**: Tracks all training metrics, monitoring metrics, drift PSI values, and visualizations
 
-## Diving Deep into Inference Monitoring Pipeline
+## Inference Monitoring Process Flow
 
-![Inference Monitoring Pipeline](docs/guides/inference_monitoring_diagram.png)
+![Inference Monitoring Process Flow](docs/guides/inference_monitoring_processflow.png)
 
-> To regenerate: `python docs/generate_inference_monitoring_diagram.py` (requires `pip install diagrams`, `brew install graphviz`, and AWS icons in `docs/icons/`)
+> **13-Step Detailed Flow**: This diagram shows the complete inference monitoring pipeline from real-time predictions through ground truth backfill, drift detection, and governance visualization. Each data flow is numbered and labeled for clarity.
 
 This detailed diagram shows the **end-to-end inference monitoring flow** with MLflow as the central monitoring interface:
 
@@ -229,13 +229,20 @@ sagemaker-automated-drift-and-trend-monitoring/
 │   ├── creditcard_ground_truth.csv           # Ground truth labels
 │   └── creditcard_drifted.csv                # Drifted data for testing
 ├── docs/
-│   ├── generate_architecture_diagram.py      # Generates architecture_diagram.png (AWS icons)
-│   ├── generate_inference_monitoring_diagram.py # Generates inference_monitoring_diagram.png (AWS icons)
+│   ├── MetaMonitoring.png                    # 11-step end-to-end architecture diagram
+│   ├── inference_monitoring_processflow.png  # 13-step inference monitoring flow
+│   ├── ARCHITECTURE_STEPS.md                 # Detailed descriptions of all 11 architecture steps
+│   ├── CRITICAL_CONFIG_SETTINGS.md           # Essential config.yaml settings guide
+│   ├── GROUND_TRUTH_FLOW.md                  # Two-table ground truth architecture
+│   ├── generate_architecture_diagram.py      # [Legacy] Generates architecture_diagram.png (AWS icons)
+│   ├── generate_inference_monitoring_diagram.py # [Legacy] Generates inference_monitoring_diagram.png (AWS icons)
 │   ├── generate_mlflow_evidently_diagram.py  # Generates mermaid-diagram-mlflow-evidently.png (AWS icons)
 │   ├── icons/                                # Official AWS Architecture Icons + third-party logos
-│   ├── guides/                               # Generated diagrams
-│   │   ├── architecture_diagram.png          # Full MLOps architecture diagram
-│   │   ├── inference_monitoring_diagram.png   # Inference monitoring pipeline diagram
+│   ├── guides/                               # Architecture diagrams and references
+│   │   ├── MetaMonitoring.png                # Main architecture diagram (11 steps)
+│   │   ├── inference_monitoring_processflow.png # Detailed monitoring flow (13 steps)
+│   │   ├── architecture_diagram.png          # [Legacy] Programmatically generated architecture
+│   │   ├── inference_monitoring_diagram.png   # [Legacy] Programmatically generated monitoring flow
 │   │   └── mermaid-diagram-mlflow-evidently.png # MLflow + Evidently monitoring flow
 │   └── screenshots/                          # Screenshots and visual guides
 │       ├── DirectTestingInSGPlayground-custom-handler.png  # SageMaker Studio screenshot
@@ -247,20 +254,24 @@ sagemaker-automated-drift-and-trend-monitoring/
 └── README.md                                 # This file
 ```
 
-## Diagram Generation
+## Architecture Diagrams
 
-All architecture diagrams use official AWS Architecture Icons and are generated with the Python `diagrams` library.
+The main architecture diagrams are:
+- **MetaMonitoring.png** — 11-step end-to-end MLOps pipeline (hand-built in Excalidraw)
+- **inference_monitoring_processflow.png** — 13-step detailed monitoring flow (hand-built in Excalidraw)
 
-### Prerequisites
+Editable source files:
+- `docs/guides/architecture_diagram.excalidraw` — Open at [excalidraw.com](https://excalidraw.com)
+- `docs/inference_monitoring_flow.excalidraw` — Generated programmatically, editable in Excalidraw
+
+### Legacy Diagram Generation
+
+Previous programmatically-generated diagrams (now superseded by hand-built versions) can be regenerated:
 
 ```bash
 pip install diagrams
 brew install graphviz  # macOS
-```
 
-### Generate All Diagrams
-
-```bash
 python docs/generate_architecture_diagram.py
 python docs/generate_inference_monitoring_diagram.py
 python docs/generate_mlflow_evidently_diagram.py
