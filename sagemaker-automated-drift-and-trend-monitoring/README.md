@@ -138,7 +138,7 @@ MLflow serves as the **unified monitoring dashboard** where all monitoring workf
 
 1. **Open-Source SDKs (MLflow, Evidently, Pandas, Scikit-learn)** - Ensures portability across AWS, GCP, Azure, or on-prem. No vendor lock-in. Industry-standard tools = easier hiring.
 
-2. **Cost Efficiency** - $255/month vs. $1,850+/month for fully managed platforms (86% savings). Serverless architecture = pay only for actual usage, not idle capacity.
+2. **Cost Efficiency** - Serverless architecture scales to zero when idle, charging only for actual usage rather than reserved capacity. Variable costs (inference invocations, Athena queries, Lambda executions) scale linearly with traffic. Fixed costs (S3 storage, MLflow tracking) remain minimal. No upfront licensing or minimum commitments required.
 
 3. **Custom Inference Monitoring** - Evidently-powered drift detection (DataDriftPreset for all features, ClassificationPreset for model performance), automated ground truth integration, and EventBridge/Lambda alerting with interactive HTML reports logged to MLflow. Most platforms lack comprehensive inference monitoring or charge premium rates.
 
@@ -2692,14 +2692,14 @@ The default dashboard provides high-level inference and model performance metric
 ## Cost Optimization
 
 **Training:**
-- Use Spot instances for training: ~70% cost savings
+- Use Spot instances for training: significantly lower compute costs
 - Training completes in 10-15 min, low spot interruption risk
 - Configure in pipeline: `instance_type="ml.m5.xlarge"`, `use_spot_instances=True`
 
 **Inference:**
-- Serverless inference: Pay per invocation, no idle costs
+- Serverless inference: Pay per invocation with automatic scaling to zero when idle
 - Cold start: 10-30 seconds (acceptable for fraud detection)
-- Alternative: Provision 1 instance for high-volume scenarios
+- Alternative: Provision dedicated instances for high-volume scenarios with predictable traffic
 
 **Storage:**
 - Athena Iceberg tables: Pay per query, not storage
