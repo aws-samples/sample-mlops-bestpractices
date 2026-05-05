@@ -4,7 +4,7 @@ Machine learning models in production degrade silently. Feature distributions sh
 
 This solution provides an end-to-end, open-source MLOps system built on Amazon SageMaker, MLflow, and Evidently AI that closes the ML governance gap. It trains an XGBoost fraud detection model via SageMaker Pipelines, logs every prediction to an Athena Iceberg data lake with zero-latency async writes, and runs automated daily drift checks using EventBridge-triggered Lambda functions. Evidently AI generates interactive data drift and classification reports, while configurable thresholds in a central `config.yaml` let teams tune sensitivity for both data and model drift without code changes. SNS alerts fire when drift exceeds thresholds, and an Amazon QuickSight governance dashboard — refreshed automatically via a dedicated EventBridge + Lambda pipeline — surfaces inference trends, drift history, and model performance in a single pane of glass.
 
-The result is a production-ready monitoring system that costs roughly $30/month (compared to $200+ for managed alternatives), runs entirely on open-source SDKs portable across clouds, and handles real-world challenges like delayed ground truth confirmations, concept drift, and multi-feature drift analysis. Three guided Jupyter notebooks walk you from training through monitoring to dashboard creation, making it straightforward to adapt this pattern to your own models and datasets.
+The result is a production-ready monitoring system with pay-as-you-go pricing that scales linearly with inference volume, runs entirely on open-source SDKs portable across clouds, and handles real-world challenges like delayed ground truth confirmations, concept drift, and multi-feature drift analysis. Three guided Jupyter notebooks walk you from training through monitoring to dashboard creation, making it straightforward to adapt this pattern to your own models and datasets.
 
 **Understanding Drift Through Visualization**
 
@@ -35,8 +35,8 @@ This is especially critical for fraud detection, where:
 Most organizations have robust training pipelines but lack production inference monitoring. They deploy models and hope for the best. When performance degrades, they discover it through business metrics (customer complaints, financial losses) rather than automated alerts. By then, damage is done.
 
 Existing solutions are inadequate:
-- **Managed platforms** cost $25K+/year and lock you into proprietary systems
-- **SageMaker Model Monitor** costs $200+/month, lacks Evidently integration, and doesn't support serverless endpoints
+- **Managed platforms** require significant upfront licensing fees and lock you into proprietary systems
+- **Built-in monitoring tools** often lack integration with open-source drift detection libraries and have limited serverless endpoint support
 - **Custom solutions** require months of engineering effort to build drift detection, ground truth integration, and alerting
 
 **This Project's Solution**
@@ -52,7 +52,7 @@ A ** Open-source MLOps system** that establishes automated monitoring and govern
 - **Governance Dashboard:** QuickSight dashboard with automated daily refresh showing inference trends, drift history, and model performance
 
 **Key Benefits:**
-- **Cost Efficient:** $30/month vs. $200+/month for managed alternatives (85% savings)
+- **Cost Efficient:** Pay-as-you-go serverless architecture scales to zero when idle. Variable costs (inference invocations, Athena queries, Lambda executions) scale linearly with traffic, while fixed costs (S3 storage, MLflow tracking) remain minimal and predictable. No upfront licensing fees or reserved capacity required.
 - **Portable:** Open-source SDKs (MLflow, Evidently, Pandas) run anywhere — AWS, GCP, Azure, on-prem
 - **Production Ready:** Handles real-world ML challenges (delayed ground truth, data drift, concept drift, alerting)
 - **Automated:** EventBridge schedules drift checks at 2 AM, QuickSight refreshes at 3 AM — no manual intervention
@@ -144,9 +144,9 @@ MLflow serves as the **unified monitoring dashboard** where all monitoring workf
 
 4. **Production-Grade Without Platform Costs** - SageMaker provides reliability (99.9% SLA) while MLflow provides portability. Best of both worlds: enterprise reliability + startup agility.
 
-**vs. Alternatives:** Databricks ($24K/year) offers similar features but 8x more expensive and locked-in. Pure AWS (SageMaker Experiments) is 2x more expensive with limited portability. Kubeflow is portable but requires 40x more DevOps effort. This solution balances cost, portability, and operational simplicity.
+**vs. Alternatives:** This solution balances pay-as-you-go pricing, portability, and operational simplicity. Fully managed platforms require significant upfront licensing and vendor lock-in. Pure cloud-native solutions lack portability. Open-source platforms are portable but require substantial DevOps investment. This architecture delivers enterprise reliability with startup agility.
 
-**Ideal For:** AWS-native teams (1-10 people) needing production ML with comprehensive monitoring, audit trails, and multi-cloud optionality without enterprise platform budgets.
+**Ideal For:** Teams needing production ML with comprehensive monitoring, audit trails, and multi-cloud optionality without enterprise platform licensing costs or operational complexity.
 
 ## Why Not SageMaker DataCaptureConfig?
 
