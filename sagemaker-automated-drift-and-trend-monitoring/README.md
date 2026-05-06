@@ -85,7 +85,7 @@ cp .env.example .env
 - Drift monitor checks thresholds and triggers alarms if exceeded
 - Results pushed to SQS → Lambda writer → `monitoring_responses` table
 
-### Step 11: Governance Dashboard (`03_governance_dashboard.ipynb`)
+### Step 11: Governance Dashboard (`3_governance_dashboard.ipynb`)
 
 **Step 11 - QuickSight Visualization**
 - Create feature drift datasets, drift scores, and severity visualizations
