@@ -1,5 +1,101 @@
 # Automated Drift and Trend Monitoring for ML Models on Amazon SageMaker
 
+## Architecture Diagram
+
+![MLOps Architecture](docs/guides/MetaMonitoring.png)
+
+> **11-Step End-to-End Flow**: This architecture shows the complete MLOps pipeline from data ingestion through training, deployment, inference monitoring, and governance. See [ARCHITECTURE_STEPS.md](docs/ARCHITECTURE_STEPS.md) for detailed descriptions of each numbered step.
+
+## Quickstart: Implementation Steps
+
+Follow these steps to implement the 11-step architecture shown above. Each step corresponds to the numbered components in the diagram.
+
+### Prerequisites
+
+**SageMaker AI Domain Setup**
+
+This solution requires a SageMaker AI domain with MLflow tracking server. If you don't have one set up already, use this CloudFormation template to create a domain with VPC configuration:
+
+[SageMaker Domain with VPC Setup](https://github.com/aws-samples/genai-ml-platform-examples/blob/main/platform/genai-ml-stdzn-on-smai/sagemaker-domain-with-vpc.yaml)
+
+### Step 1: Configure Environment
+
+Copy `.env.example` to `.env` and update with your specific environment variables. Settings in `.env` will override all other defaults and settings in `config.yaml`.
+
+```bash
+git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
+cd sagemaker-automated-drift-and-trend-monitoring
+cp .env.example .env
+```
+
+**Required `.env` settings:**
+- `SAGEMAKER_EXEC_ROLE` - ARN of SageMaker execution role
+- `MLFLOW_TRACKING_URI` - ARN of SageMaker MLflow tracking server
+- `DATA_S3_BUCKET` - S3 bucket name for data storage
+- `AWS_DEFAULT_REGION` - AWS region (must match your domain region)
+
+### Steps 1-5: Training Pipeline (`1_training_pipeline.ipynb`)
+
+**Step 1 - Data Ingestion**
+- S3 data loaded into Training Data table
+- The repository provides scripts to generate the training dataset (`generate_datasets.py`) if you would like to test with the sample dataset
+- Alternatively, you can replace `training_data` with your own dataset
+
+**Step 2 - Feature Engineering**
+- PySpark processing transforms raw data into features
+- Handles missing values, derives velocity scores, time-based features
+
+**Step 3 - Model Training**
+- XGBoost training on preprocessed features
+- Hyperparameters configured in pipeline definition
+
+**Step 4 - Model Evaluation & Registration**
+- Training steps and evaluation steps log to SageMaker AI MLflow App
+- Unified experiment tracking and drift computation environment
+- Model registered with versioning and metadata
+
+**Step 5 - Model Deployment**
+- Custom handler deployed to SageMaker AI inference endpoint
+- Once deployed, the inference handler writes all inferences to SQS and Lambda
+- All notebooks include convenience script invocations for role creation and infrastructure setup (SQS, Lambda, roles, etc.)
+
+### Steps 6-10: Inference Monitoring (`2a_inference_monitoring.ipynb`)
+
+**Step 6 - Real-Time Inference Logging**
+- Endpoint logs predictions to SQS → Lambda → Athena `inference_responses` table
+- Async logging with zero latency impact
+
+**Step 7 - Ground Truth Collection** (Optional for testing)
+- Simulate ground truth to test data and model drift detection
+- In production, fraud confirmations arrive from investigation teams
+
+**Step 8 - Ground Truth Backfill**
+- Merge ground truth with inference responses
+- Reconcile actual fraud outcomes with predictions based on `inference_id`
+- Athena MERGE operation on Iceberg table (ACID compatible)
+
+**Step 9 - Scheduled Drift Detection**
+- EventBridge triggers Lambda drift monitor (daily 2 AM UTC)
+- Compares training data (baseline) vs inference responses (current data)
+- Runs Evidently AI drift analysis (PSI, KS tests)
+
+**Step 10 - Drift Report Generation**
+- `lambda_drift_monitor` uses Evidently to generate interactive charts
+- Reports logged to SageMaker AI MLflow App
+- Drift monitor checks thresholds and triggers alarms if exceeded
+- Results pushed to SQS → Lambda writer → `monitoring_responses` table
+
+### Step 11: Governance Dashboard (`03_governance_dashboard.ipynb`)
+
+**Step 11 - QuickSight Visualization**
+- Create feature drift datasets, drift scores, and severity visualizations
+- Observe trends for feature drift, model drift, and data drift
+- Dashboard queries Athena tables directly (inference_responses, monitoring_responses)
+- Auto-refresh via EventBridge + Lambda (3 AM UTC daily)     
+
+
+# Introduction
+
 Machine learning models in production degrade silently. Feature distributions shift, fraud patterns evolve, and by the time business metrics reveal the problem, the damage is done. Most teams invest heavily in training pipelines but leave inference monitoring as an afterthought — relying on expensive managed platforms or discovering issues through customer complaints.
 
 This solution provides an end-to-end, open-source MLOps system built on Amazon SageMaker, MLflow, and Evidently AI that closes the ML governance gap. It trains an XGBoost fraud detection model via SageMaker Pipelines, logs every prediction to an Athena Iceberg data lake with zero-latency async writes, and runs automated daily drift checks using EventBridge-triggered Lambda functions. Evidently AI generates interactive data drift and classification reports, while configurable thresholds in a central `config.yaml` let teams tune sensitivity for both data and model drift without code changes. SNS alerts fire when drift exceeds thresholds, and an Amazon QuickSight governance dashboard — refreshed automatically via a dedicated EventBridge + Lambda pipeline — surfaces inference trends, drift history, and model performance in a single pane of glass.
@@ -16,7 +112,6 @@ The QuickSight governance dashboard features drift score trendlines that plot ea
 
 Production-grade ML pipeline for credit card fraud detection using AWS SageMaker Pipelines, MLflow tracking, and Athena data lake integration with comprehensive inference monitoring and drift detection.
 
-## Overview
 
 **Why This Project Matters**
 
@@ -57,18 +152,6 @@ A ** Open-source MLOps system** that establishes automated monitoring and govern
 - **Production Ready:** Handles real-world ML challenges (delayed ground truth, data drift, concept drift, alerting)
 - **Automated:** EventBridge schedules drift checks at 2 AM, QuickSight refreshes at 3 AM — no manual intervention
 - **Comprehensive:** Training, inference, monitoring, drift detection, and governance in one integrated system
-
-## Architecture Diagram
-
-![MLOps Architecture](docs/guides/MetaMonitoring.png)
-
-> **11-Step End-to-End Flow**: This architecture shows the complete MLOps pipeline from data ingestion through training, deployment, inference monitoring, and governance. See [ARCHITECTURE_STEPS.md](docs/ARCHITECTURE_STEPS.md) for detailed descriptions of each numbered step.
-
-The diagram above shows the complete MLOps architecture including:
-- **Training Pipeline** (top): Orchestrated by `1_training_pipeline.ipynb`, includes preprocessing, training, deployment, and inference with SQS logging
-- **Central Data Lake**: Athena tables for training data, inference responses, and ground truth updates
-- **Monitoring Infrastructure** (bottom): Orchestrated by `2a_inference_monitoring.ipynb`, includes manual drift analysis and automated monitoring with EventBridge, Lambda, and SNS alerts
-- **MLflow Integration**: Tracks all training metrics, monitoring metrics, drift PSI values, and visualizations
 
 ## Inference Monitoring Process Flow
 
