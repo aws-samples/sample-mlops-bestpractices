@@ -12,15 +12,20 @@ Follow these steps to implement the 11-step architecture shown above. Each step 
 
 ### Prerequisites
 
-- AWS CLI configured with credentials for the target account
-- IAM permissions to create CloudFormation stacks, IAM roles, SageMaker domains, Lambda functions, and VPC resources
-- A supported region (us-east-1, us-west-2, eu-west-1, etc. — requires SageMaker + MLflow availability)
+**This solution requires:**
+- SageMaker AI domain with MLflow tracking server
+- SageMaker execution role with permissions for S3, Athena, Lambda, SQS, SNS, EventBridge
+- S3 bucket for data storage
 
-### Setup: Deploy with CloudFormation
+**Choose your setup path:**
 
-The `cloudformation/` folder provides a single-stack deployment that provisions everything you need: SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, VPC, SQS inference logging queue, Lambda inference logger with event source mapping, and IAM execution role with all required permissions (S3, Athena, Glue, Lambda, SQS, EventBridge, KMS, Lake Formation, CloudWatch Logs, CloudWatch Metrics/Alarms/Dashboards, MLflow). On first space launch, the lifecycle script auto-clones this repo, generates synthetic datasets, uploads data to S3, creates Athena tables, and writes a populated `.env` file (including SQS queue URL).
+#### Option A: Automated Setup with CloudFormation (Recommended for New Users)
 
-**Deploy:**
+**Use this if you DON'T have an existing SageMaker domain.**
+
+The `cloudformation/` folder provides a one-command deployment that provisions the SageMaker domain, user profile, JupyterLab space, MLflow tracking server, S3 data bucket, and supporting VPC. On first launch, the space auto-clones this repo and writes a populated `.env` file.
+
+**Quick deploy:**
 
 ```bash
 aws cloudformation create-stack \
@@ -28,152 +33,63 @@ aws cloudformation create-stack \
   --template-body file://cloudformation/sagemaker-mlflow-setup.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
   --region <your-region>
-
-# Wait for stack creation (~10-15 minutes)
-aws cloudformation wait stack-create-complete \
-  --stack-name fraud-detection-monitoring \
-  --region <your-region>
 ```
 
-**After deploy:**
+Then open the SageMaker console → Domains → your domain → **Run Space**. Notebooks and `.env` are ready to use immediately.
 
-1. Open the SageMaker console → Domains → `fraud-detection-monitoring-domain`
-2. Select the user profile and click **Spaces → Run Space**
-3. Once JupyterLab starts, verify the lifecycle script completed:
-   - `sample-mlops-bestpractices/` directory is present
-   - `.env` file has AWS region, execution role, MLflow ARN, and data bucket populated
-   - `CLOUDFORMATION_SETUP_COMPLETE.md` exists with next steps
-
-**Get the MLflow UI URL:**
-
-```bash
-aws sagemaker describe-mlflow-tracking-server \
-  --tracking-server-name fraud-detection-monitoring-mlflow \
-  --query TrackingServerUrl --output text \
-  --region <your-region>
-```
-
-**Optional parameters:**
-
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `ProjectName` | `fraud-detection-monitoring` | Prefix for all named resources |
-| `UserProfileName` | `fraud-detection-user` | SageMaker user profile name |
-| `JupyterLabInstance` | `ml.t3.medium` | Instance type for JupyterLab space |
-| `GitHubRepo` | This repo URL | Repository to clone |
-| `UseExistingBucket` | `false` | Reuse an existing S3 bucket |
-| `UseExistingRole` | `false` | Reuse an existing IAM role |
-| `UseExistingVPC` | `false` | Reuse an existing VPC and subnets |
-
-Pass parameters with `--parameters ParameterKey=<name>,ParameterValue=<value>`.
-
-See **[`cloudformation/README.md`](cloudformation/README.md)** for full update/delete instructions and advanced troubleshooting.
+📖 See **[`cloudformation/README.md`](cloudformation/README.md)** for full deploy/update/delete instructions, parameters, and troubleshooting.
 
 ---
 
-### Troubleshooting: Lifecycle Script Failures
+#### Option B: Manual Setup (For Existing SageMaker Domains)
 
-The lifecycle script runs automatically on first space launch. If it fails partway through (e.g., due to network issues or timeouts), some resources may not have been created. Check the lifecycle script logs in CloudWatch under `/aws/sagemaker/studio` filtered by your domain ID.
+**Use this if you ALREADY have a SageMaker domain with MLflow tracking server.**
 
-#### If S3 data upload failed
+1. **Clone repository in your JupyterLab environment:**
+   ```bash
+   git clone https://github.com/aws-samples/sample-mlops-bestpractices.git
+   cd sagemaker-automated-drift-and-trend-monitoring
+   ```
 
-The lifecycle script generates synthetic datasets and uploads them to S3. If this step failed, run it manually from the JupyterLab terminal:
+2. **Create and configure `.env` file:**
+   ```bash
+   cp .env.example .env
+   ```
 
-```bash
-cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
+3. **Edit `.env` and populate these required values:**
+   - `SAGEMAKER_EXEC_ROLE` - ARN of your SageMaker execution role
+   - `MLFLOW_TRACKING_URI` - ARN of your MLflow tracking server
+   - `DATA_S3_BUCKET` - Name of your S3 bucket for data storage
+   - `AWS_DEFAULT_REGION` - Your AWS region (e.g., us-east-1)
 
-# Load environment variables
-source .env 2>/dev/null || export $(cat .env | grep -v '^#' | xargs)
-
-# Install dependencies (if not already installed)
-pip install .
-
-# Generate synthetic datasets
-python data/generate_datasets.py
-
-# Rename generated files (drop "generated_" prefix)
-mv data/generated_creditcard_predictions_final.csv data/creditcard_predictions_final.csv
-mv data/generated_creditcard_drifted.csv data/creditcard_drifted.csv
-mv data/generated_creditcard_ground_truth.csv data/creditcard_ground_truth.csv
-
-# Upload to S3
-python -m src.setup.upload_data_to_s3
-```
-
-Verify the upload succeeded:
-
-```bash
-aws s3 ls s3://${DATA_S3_BUCKET}/fraud-detection/data/
-# Expected output:
-#   creditcard_predictions_final.csv
-#   creditcard_ground_truth.csv
-#   creditcard_drifted.csv
-```
-
-#### If Athena table creation failed
-
-The lifecycle script creates the Athena database and Iceberg tables. If this step failed, run it manually:
-
-```bash
-cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
-
-# Load environment variables
-source .env 2>/dev/null || export $(cat .env | grep -v '^#' | xargs)
-
-# Create Athena database and all Iceberg tables
-python -m src.setup.setup_athena_tables
-```
-
-Verify the tables were created:
-
-```bash
-aws athena start-query-execution \
-  --query-string "SHOW TABLES IN fraud_detection" \
-  --result-configuration "OutputLocation=s3://${DATA_S3_BUCKET}/athena-results/" \
-  --region ${AWS_DEFAULT_REGION}
-```
-
-Expected tables: `training_data`, `inference_responses`, `ground_truth`, `ground_truth_updates`, `drifted_data`
-
-#### If both S3 upload and Athena setup failed
-
-Run the full setup sequence:
-
-```bash
-cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
-
-# Install dependencies
-pip install .
-
-# Generate and upload data
-python data/generate_datasets.py
-mv data/generated_creditcard_predictions_final.csv data/creditcard_predictions_final.csv
-mv data/generated_creditcard_drifted.csv data/creditcard_drifted.csv
-mv data/generated_creditcard_ground_truth.csv data/creditcard_ground_truth.csv
-python -m src.setup.upload_data_to_s3
-
-# Create Athena tables
-python -m src.setup.setup_athena_tables
-```
-
----
+4. **Verify configuration:**
+   ```python
+   from dotenv import load_dotenv
+   import os
+   
+   load_dotenv()
+   print(f"✅ Region: {os.getenv('AWS_DEFAULT_REGION')}")
+   print(f"✅ Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
+   print(f"✅ MLflow URI: {os.getenv('MLFLOW_TRACKING_URI')}")
+   print(f"✅ S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
+   ```
 
 ### Step 1: Verify Environment Configuration
 
-Your environment is automatically configured by the CloudFormation lifecycle script. Verify in a notebook:
+**If you used CloudFormation (Option A):** Your environment is already configured. Verify in a notebook:
 
 ```python
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
-print(f"Region: {os.getenv('AWS_DEFAULT_REGION')}")
-print(f"Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
-print(f"MLflow URI: {os.getenv('MLFLOW_TRACKING_URI')}")
-print(f"S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
+print(f"✅ Region: {os.getenv('AWS_DEFAULT_REGION')}")
+print(f"✅ Exec Role: {os.getenv('SAGEMAKER_EXEC_ROLE')}")
+print(f"✅ MLflow URI: {os.getenv('MLFLOW_TRACKING_URI')}")
+print(f"✅ S3 Bucket: {os.getenv('DATA_S3_BUCKET')}")
 ```
 
-If any values are missing, check the `.env` file was created correctly by the lifecycle script. The expected values come from the CloudFormation stack outputs.
+**If you used Manual Setup (Option B):** Verify your `.env` file contains all four required values, then run the verification code above.
 
 ### Steps 1-5: Training Pipeline (`1_training_pipeline.ipynb`)
 
@@ -523,44 +439,263 @@ For full details on deploying, updating, and deleting the stack — including pa
 
 ## Quick Start
 
-After deploying the CloudFormation stack and running the JupyterLab space (see [Setup: Deploy with CloudFormation](#setup-deploy-with-cloudformation)), the environment is ready to use. The lifecycle script has already:
+### Prerequisites
 
-- Cloned the repository
-- Generated synthetic datasets and uploaded them to S3
-- Created the Athena database and Iceberg tables
-- Written a populated `.env` file
+- Python 3.12+
+- AWS account with SageMaker access
+- `uv` package manager
 
-### CloudWatch Permissions (for Drift Monitoring Dashboard & Alarms)
+### Installation
 
-The CloudFormation execution role **automatically includes** CloudWatch Metrics/Alarms/Dashboards permissions via the `${ProjectName}-CloudWatchMetricsAccess` inline policy. No manual action is required for standard deployments.
+```bash
+# Configure environment
+cp .env.example .env
+# Edit .env with your AWS settings
+```
 
-> **If using `UseExistingRole=true`:** Your existing role must include the following permissions for Cell 40 in `2a_inference_monitoring.ipynb` to work (publish custom metrics, create alarms, and build dashboards):
->
-> ```json
-> {
->   "Version": "2012-10-17",
->   "Statement": [
->     {
->       "Effect": "Allow",
->       "Action": [
->         "cloudwatch:PutMetricData",
->         "cloudwatch:PutMetricAlarm",
->         "cloudwatch:DescribeAlarms",
->         "cloudwatch:PutDashboard",
->         "cloudwatch:GetDashboard",
->         "cloudwatch:ListDashboards"
->       ],
->       "Resource": "*"
->     }
->   ]
-> }
-> ```
+### Upload Data Files to S3
 
-### SQS + Lambda Inference Logging (Auto-Provisioned)
+The CSV data files (`data/*.csv`) are not checked into git. If you don't plan to use your own Athena tables for training and need local data to get started, use the generator script to produce synthetic datasets with the same schema and statistical properties:
 
-The CloudFormation stack **automatically provisions** the SQS queue (`${ProjectName}-inference-logging`), Lambda inference logger (`${ProjectName}-inference-logger`), and event source mapping (batch size 10, 30s window). The `.env` file is pre-populated with `SQS_URL`, `SQS_QUEUE_NAME`, and `LAMBDA_LOGGER_NAME`. No manual action is required for standard deployments.
+```bash
+# Generate all three CSVs (predictions, drifted, ground truth)
+python data/generate_datasets.py
 
-> **If not using CloudFormation:** Run `uv run main.py setup-logging` manually, then update `SQS_URL` in `.env` with the created queue URL.
+# Or generate individually
+python data/generate_datasets.py --predictions
+python data/generate_datasets.py --drifted
+python data/generate_datasets.py --ground-truth
+```
+
+This creates files with a `generated_` prefix. Rename them to use in the pipeline:
+
+```bash
+cd data
+mv generated_creditcard_predictions_final.csv creditcard_predictions_final.csv
+mv generated_creditcard_drifted.csv creditcard_drifted.csv
+mv generated_creditcard_ground_truth.csv creditcard_ground_truth.csv
+```
+
+Verify the files are in place:
+
+```bash
+ls -lh data/*.csv
+# Expected files:
+#   creditcard_predictions_final.csv  (~50 MB, 284K rows, training data)
+#   creditcard_ground_truth.csv       (ground truth labels)
+#   creditcard_drifted.csv            (drifted data for testing)
+```
+
+**Step 2: Upload to S3**
+
+```bash
+# Preview what will be uploaded (dry run)
+python -m src.setup.upload_data_to_s3 --dry-run
+
+# Upload all CSV files to S3
+python -m src.setup.upload_data_to_s3
+
+# Upload a single file
+python -m src.setup.upload_data_to_s3 --file data/creditcard_predictions_final.csv
+```
+
+This uploads the CSV files to `s3://<DATA_S3_BUCKET>/fraud-detection/data/`. The S3 paths are used by the Athena data migration step (`main.py setup --migrate-data`) and by the inference monitoring notebook for baseline drift detection.
+
+### Configuration (.env) - change these in .env to match your environment
+
+```bash
+# MLflow - Use ARN format for programmatic access
+MLFLOW_TRACKING_URI=arn:aws:sagemaker:us-east-1:YOUR_ACCOUNT:mlflow-app/app-YOUR_ID
+MLFLOW_EXPERIMENT_NAME=credit-card-fraud-detection-training
+MLFLOW_MODEL_NAME=xgboost-fraud-detector
+
+# AWS
+AWS_DEFAULT_REGION=us-east-1
+SAGEMAKER_EXEC_ROLE=arn:aws:iam::YOUR_ACCOUNT:role/SageMakerExecutionRole
+
+# Athena
+ATHENA_DATABASE=fraud_detection
+DATA_S3_BUCKET=fraud-detection-data-lake-YOUR_ACCOUNT
+ATHENA_OUTPUT_S3=s3://fraud-detection-data-lake-YOUR_ACCOUNT/athena-query-results/
+
+# SQS
+SQS_QUEUE_URL=<Set after configuring SQS>
+SQS_QUEUE_NAME=fraud-inference-logs
+
+LAMBDA_LOGGER_NAME=fraud-inference-log-consumer
+```
+
+### Add S3 Permissions For Data Migration
+
+Add the following inline policy to your execution role through the UI to give S3 access:
+
+```json
+json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutBucketVersioning",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<DATA_S3_BUCKET>",
+        "arn:aws:s3:::<DATA_S3_BUCKET>/*"
+      ]
+    }
+  ]
+}
+```
+
+### Setup Infrastructure
+
+```bash
+# Upload CSV data to S3 (required before migration)
+python -m src.setup.upload_data_to_s3
+
+# Create S3 bucket, Athena database, Iceberg tables, and migrate CSV data
+python main.py setup --migrate-data
+```
+
+This creates:
+- S3 bucket for data lake and model artifacts
+- Athena database `fraud_detection`
+- 5 Iceberg tables: `training_data`, `inference_responses`, `ground_truth`, `ground_truth_updates`, `drifted_data`
+- Migrates CSV data to Athena for pipeline access
+
+### Add Permissions For Lambda Access
+
+Add the following inline policy to your execution role to allow it to manage Lambda functions.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "lambda:CreateFunction",
+    "lambda:UpdateFunctionCode",
+    "lambda:UpdateFunctionConfiguration",
+    "lambda:GetFunction",
+    "lambda:DeleteFunction",
+    "lambda:InvokeFunction"
+  ],
+  "Resource": "arn:aws:lambda:us-east-1:YOUR_ACCOUNT:function:fraud-detection-*"
+},
+{
+  "Effect": "Allow",
+  "Action": "iam:PassRole",
+  "Resource": "arn:aws:iam::YOUR_ACCOUNT:role/*",
+  "Condition": {
+    "StringEquals": {
+      "iam:PassedToService": "lambda.amazonaws.com"
+    }
+  }
+}
+```
+
+Add the following trust policy to allow Lambda to assume the execution role
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "sagemaker.amazonaws.com",
+          "lambda.amazonaws.com"
+        ]
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+### Configure SQS + Lambda Permissions
+Add the following permissions to allow the creation of an SQS queue and lambda function for inference logging to Athena:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:GetQueueUrl"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:SendMessage"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:GetFunction",
+        "lambda:CreateEventSourceMapping"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "<EXECUTION_ROLE>",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "lambda.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+```
+
+### Add CloudWatch Permissions (for Drift Monitoring Dashboard & Alarms)
+
+The `CloudWatchLogsFullAccess` managed policy only covers Logs. To publish custom metrics, create alarms, and build dashboards (Cell 40 in `2a_inference_monitoring.ipynb`), add this inline policy to your execution role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData",
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:PutDashboard",
+        "cloudwatch:GetDashboard",
+        "cloudwatch:ListDashboards"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+### Setup SQS + Lambda
+```
+uv run main.py setup-logging
+```
+
+Update the SQS_URL in .env with the created SQS queue.
 
 ### Run Complete Pipeline
 

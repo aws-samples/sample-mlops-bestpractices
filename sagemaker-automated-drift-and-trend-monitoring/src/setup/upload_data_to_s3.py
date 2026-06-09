@@ -25,7 +25,7 @@ from src.config.config import (
     AWS_DEFAULT_REGION,
     DATA_DIR,
     DATA_S3_BUCKET,
-    DATA_S3_PREFIX,
+    S3_PREFIX,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,7 @@ def main():
     args = parser.parse_args()
 
     bucket = args.bucket or DATA_S3_BUCKET
-    prefix = args.prefix or DATA_S3_PREFIX
+    prefix = args.prefix or S3_PREFIX
 
     results = upload_all(
         bucket=bucket,
