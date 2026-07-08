@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Simplified SageMaker Domain setup for Automated Drift and Trend Monitoring.
-  Creates: SageMaker Domain (PublicInternetOnly), MLflow Tracking Server,
+  Creates: SageMaker Domain (PublicInternetOnly), MLflow App,
   JupyterLab Space with repo clone, S3 bucket, and IAM execution role.
 
 Parameters:
@@ -828,29 +828,41 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Control-plane: manage the tracking-server resource itself.
+              # Control-plane: manage the MLflow App resource itself.
+              # NOTE: MLflow Apps have NO Start/Stop actions (unlike the old
+              # MlflowTrackingServer, which was a persistent server you could
+              # start/stop). Apps are managed, so only Create/Update/Delete/
+              # Describe/List + the presigned-URL action exist.
               - Effect: Allow
                 Action:
-                  - 'sagemaker:CreateMlflowTrackingServer'
-                  - 'sagemaker:UpdateMlflowTrackingServer'
-                  - 'sagemaker:DeleteMlflowTrackingServer'
-                  - 'sagemaker:DescribeMlflowTrackingServer'
-                  - 'sagemaker:ListMlflowTrackingServers'
-                  - 'sagemaker:StartMlflowTrackingServer'
-                  - 'sagemaker:StopMlflowTrackingServer'
-                  # Needed by the Studio console to mint the signed URL
-                  # that opens the MLflow UI in a new tab.
-                  - 'sagemaker:CreatePresignedMlflowTrackingServerUrl'
+                  - 'sagemaker:CreateMlflowApp'
+                  - 'sagemaker:UpdateMlflowApp'
+                  - 'sagemaker:DeleteMlflowApp'
+                  - 'sagemaker:DescribeMlflowApp'
+                  - 'sagemaker:ListMlflowApps'
+                  # Mints the signed URL that opens the MLflow UI in a new tab
+                  # (Studio -> Partner AI Apps -> MLflow).
+                  - 'sagemaker:CreatePresignedMlflowAppUrl'
                 Resource: '*'
-              # Data-plane: open the MLflow UI and read/write experiments,
-              # runs, metrics, params, tags, and registered models. This is
-              # the `sagemaker-mlflow:AccessUI` action surfaced in the
-              # "not authorized to perform" error, plus the REST actions
-              # mlflow-client calls against the server from notebooks.
+              # Data-plane gateway: MLflow Apps introduce a new action that
+              # authorizes MLflow API traffic against the App. This is the
+              # App-specific equivalent of the tracking server's data plane and
+              # CAN be scoped to MLflow App ARNs in this account/region.
+              - Effect: Allow
+                Action:
+                  - 'sagemaker:CallMlflowAppApi'
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:mlflow-app/*'
+              # Data-plane granular ops: open the MLflow UI and read/write
+              # experiments, runs, metrics, params, tags, and registered models
+              # (the REST actions the mlflow client calls from notebooks/Lambda).
+              # The `sagemaker-mlflow` service only defines the
+              # `mlflow-tracking-server` resource type — there is NO mlflow-app
+              # resource type — so these actions cannot be scoped to an App ARN
+              # and must use "*".
               - Effect: Allow
                 Action:
                   - 'sagemaker-mlflow:*'
-                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:mlflow-tracking-server/*'
+                Resource: '*'
         - PolicyName: !Sub '${ProjectName}-EventBridgeAccess'
           PolicyDocument:
             Version: '2012-10-17'
@@ -1296,7 +1308,7 @@ Resources:
             AWS_DEFAULT_REGION=${AWS::Region}
             SAGEMAKER_EXEC_ROLE=arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole
             SAGEMAKER_DOMAIN_ID=${SageMakerDomain}
-            MLFLOW_TRACKING_URI=${MLflowTrackingServer.TrackingServerArn}
+            MLFLOW_TRACKING_URI=${MLflowApp.Arn}
             DATA_S3_BUCKET=${ProjectName}-data-${AWS::AccountId}
             PROJECT_NAME=${ProjectName}
             # 🚨 IMPORTANT: replace nobody@example.com with a real email to receive
@@ -1492,7 +1504,7 @@ Resources:
     UpdateReplacePolicy: Delete
     DependsOn:
       - UserProfile
-      - MLflowTrackingServer
+      - MLflowApp
       - SpaceLifecycleConfig
     Properties:
       DomainId: !Ref SageMakerDomain
@@ -1514,20 +1526,21 @@ Resources:
           Value: CloudFormation
 
   # ====================================================================
-  # MLflow Tracking Server
+  # MLflow App
   # ====================================================================
-  MLflowTrackingServer:
-    Type: AWS::SageMaker::MlflowTrackingServer
+  MLflowApp:
+    Type: AWS::SageMaker::MlflowApp
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      TrackingServerName: !Sub '${ProjectName}-mlflow'
+      Name: !Sub '${ProjectName}-mlflow'
       ArtifactStoreUri: !Sub 's3://${ProjectName}-data-${AWS::AccountId}/mlflow-artifacts'
       RoleArn: !If
         - CreateNewRole
         - !GetAtt SageMakerExecutionRole.Arn
         - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-SageMakerExecutionRole'
-      AutomaticModelRegistration: true
+      # Replaces the tracking server's boolean AutomaticModelRegistration.
+      ModelRegistrationMode: AutoModelRegistrationEnabled
       WeeklyMaintenanceWindowStart: 'Sun:03:00'
       Tags:
         - Key: Name
@@ -1695,21 +1708,21 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
 
-  MLflowTrackingServerArn:
-    Description: MLflow Tracking Server ARN
-    Value: !GetAtt MLflowTrackingServer.TrackingServerArn
+  MLflowAppArn:
+    Description: MLflow App ARN (used as MLFLOW_TRACKING_URI by the SDK)
+    Value: !GetAtt MLflowApp.Arn
     Export:
       Name: !Sub '${AWS::StackName}-MLflowArn'
 
-  MLflowTrackingServerName:
-    Description: MLflow Tracking Server Name (use with describe-mlflow-tracking-server to get URL)
-    Value: !Sub '${ProjectName}-mlflow'
+  MLflowAppId:
+    Description: MLflow App ID (use with create-presigned-mlflow-app-url to open the UI)
+    Value: !GetAtt MLflowApp.MlflowAppId
     Export:
-      Name: !Sub '${AWS::StackName}-MLflowName'
+      Name: !Sub '${AWS::StackName}-MLflowAppId'
 
   GetMLflowUrlCommand:
-    Description: Command to get MLflow UI URL
-    Value: !Sub 'aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query TrackingServerUrl --output text --region ${AWS::Region}'
+    Description: Command to get a presigned MLflow UI URL
+    Value: !Sub 'aws sagemaker create-presigned-mlflow-app-url --mlflow-app-id ${MLflowApp.MlflowAppId} --query AuthorizedUrl --output text --region ${AWS::Region}'
 
   InferenceLoggingQueueUrl:
     Description: SQS Queue URL for inference logging
@@ -1739,4 +1752,4 @@ Outputs:
       7. Once JupyterLab loads, check CLOUDFORMATION_SETUP_COMPLETE.md for next steps
 
       Get MLflow UI URL:
-      aws sagemaker describe-mlflow-tracking-server --tracking-server-name ${ProjectName}-mlflow --query TrackingServerUrl --output text --region ${AWS::Region}
+      aws sagemaker create-presigned-mlflow-app-url --mlflow-app-id ${MLflowApp.MlflowAppId} --query AuthorizedUrl --output text --region ${AWS::Region}
