@@ -118,8 +118,15 @@ echo ""
 # --- Pre-flight checks ---
 echo "[Pre-flight checks]"
 
-# Check if main stack exists
-BASE_STACK="fraud-detection-sagemaker-setup"
+# Check if the base stack exists. deploy-main-stack.sh names the base stack
+# after PROJECT_NAME from config (e.g. "fraud-detection-monitoring"), so derive
+# the same value here instead of hardcoding a stale name. Ensure get_config is
+# available (the region block above only sources it when --region was omitted).
+if ! command -v get_config >/dev/null 2>&1; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  [ -f "$SCRIPT_DIR/../scripts/_read_config.sh" ] && source "$SCRIPT_DIR/../scripts/_read_config.sh"
+fi
+BASE_STACK="$(get_config PROJECT_NAME 2>/dev/null || echo 'fraud-detection-monitoring')"
 if ! aws cloudformation describe-stacks \
     --stack-name "$BASE_STACK" \
     --region "$REGION" &>/dev/null; then

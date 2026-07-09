@@ -1,8 +1,12 @@
 #!/bin/bash
 set -e
 
-STACK_NAME="${1:-fraud-detection-sagemaker-setup}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+# Resolve stack name + region from config (matches deploy-main-stack.sh) so the
+# defaults target the real base stack (PROJECT_NAME) instead of a stale name.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/../scripts/_read_config.sh" ] && source "$SCRIPT_DIR/../scripts/_read_config.sh"
+STACK_NAME="${1:-$(get_config PROJECT_NAME 2>/dev/null || echo 'fraud-detection-monitoring')}"
+REGION="${AWS_DEFAULT_REGION:-$(get_config AWS_DEFAULT_REGION 2>/dev/null || echo 'us-east-1')}"
 
 echo "=== SageMaker CloudFormation Stack Cleanup ==="
 echo "Stack: $STACK_NAME"
