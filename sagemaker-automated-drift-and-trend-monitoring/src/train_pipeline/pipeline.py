@@ -200,9 +200,9 @@ class FraudDetectionPipeline:
             'processing_instance_type': kwargs.get('processing_instance_type', 'ml.m5.xlarge'),
             'training_instance_type': kwargs.get('training_instance_type', 'ml.m5.xlarge'),
             'transform_instance_type': kwargs.get('transform_instance_type', 'ml.m5.xlarge'),
-            'framework_version': kwargs.get('framework_version', '1.2-1'),
+            'framework_version': kwargs.get('framework_version', '1.4-2'),
             'py_version': kwargs.get('py_version', 'py3'),
-            'xgboost_version': kwargs.get('xgboost_version', '1.7-1'),
+            'xgboost_version': kwargs.get('xgboost_version', '3.0-5'),
         }
 
         # Lambda configuration
@@ -360,13 +360,34 @@ class FraudDetectionPipeline:
         """
         logger.info("Creating Athena seed step...")
 
-        # Use the SKLearn container image — it's small, has boto3, and starts
-        # quickly. We don't import sklearn; we only need a Python runtime.
-        sklearn_image = retrieve_image_uri(
+        # The seed step only needs a generic Python runtime + boto3 (it does
+        # NOT import sklearn). We pin the SageMaker scikit-learn image built on
+        # Python 3.12 (ECR tag `<framework_version>-py312`) instead of the old
+        # 1.2-1 image (Python 3.8). The version comes from config
+        # (`framework_version`, default 1.4-2) — the ONLY sklearn version knob.
+        #
+        # The SDK's image_uris config has no version key that maps to the
+        # py312 tag — retrieve() only ever emits `<version>-cpu-py3` (Python
+        # 3.10 for 1.4-2) and rejects py_version="py312". So we let retrieve()
+        # resolve the region-correct registry account + repository, then swap
+        # the tag to `<version>-py312`. This keeps the account/region portable
+        # (the account differs per region) without hardcoding it. Verified the
+        # 1.4-2-py312 image is present with an identical digest across all
+        # commercial regions checked (us/eu/ap/ca/sa).
+        #
+        # NOTE: the configured framework_version must have a published
+        # `-py312` container build. Today only 1.4-2 does; if you change
+        # framework_version, confirm the `<version>-py312` tag exists in ECR.
+        _sklearn_version = self.config['framework_version']
+        _sklearn_base_uri = retrieve_image_uri(
             framework="sklearn",
             region=self.region,
-            version="1.2-1",
+            version=_sklearn_version,
+            image_scope="training",
         )
+        # e.g. <acct>.dkr.ecr.<region>.amazonaws.com/sagemaker-scikit-learn:1.4-2-cpu-py3
+        #   -> <acct>.dkr.ecr.<region>.amazonaws.com/sagemaker-scikit-learn:1.4-2-py312
+        sklearn_image = f"{_sklearn_base_uri.rsplit(':', 1)[0]}:{_sklearn_version}-py312"
 
         # Bundle seed_athena_tables.py together with schema.py + its YAML
         # sidecar in a source_dir so the container-side `import schema`
