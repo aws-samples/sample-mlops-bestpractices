@@ -941,6 +941,9 @@ Resources:
                   - 'lambda:RemovePermission'
                   - 'lambda:GetFunctionConfiguration'
                   - 'lambda:GetPolicy'
+                  - 'lambda:TagResource'
+                  - 'lambda:UntagResource'
+                  - 'lambda:ListTags'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-SQSAccess'
           PolicyDocument:
@@ -958,6 +961,9 @@ Resources:
                   - 'sqs:DeleteMessage'
                   - 'sqs:PurgeQueue'
                   - 'sqs:ListQueues'
+                  - 'sqs:TagQueue'
+                  - 'sqs:UntagQueue'
+                  - 'sqs:ListQueueTags'
                 Resource: '*'
         - PolicyName: !Sub '${ProjectName}-CloudWatchMetricsAccess'
           PolicyDocument:
@@ -1005,6 +1011,9 @@ Resources:
                   - 'sns:SetTopicAttributes'
                   - 'sns:ListTopics'
                   - 'sns:ListSubscriptionsByTopic'
+                  - 'sns:TagResource'
+                  - 'sns:UntagResource'
+                  - 'sns:ListTagsForResource'
                 Resource: '*'
         # IAM role management for the drift-monitor / monitoring-writer
         # Lambda roles. The notebook (cell-33) and deploy_monitoring_writer

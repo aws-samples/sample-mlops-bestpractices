@@ -137,7 +137,10 @@ def get_custom_policy(account_id: str, region: str) -> dict:
                     "lambda:DeleteEventSourceMapping",
                     "lambda:GetEventSourceMapping",
                     "lambda:ListEventSourceMappings",
-                    "lambda:UpdateEventSourceMapping"
+                    "lambda:UpdateEventSourceMapping",
+                    "lambda:TagResource",
+                    "lambda:UntagResource",
+                    "lambda:ListTags"
                 ],
                 "Resource": "*"
             },
@@ -154,7 +157,10 @@ def get_custom_policy(account_id: str, region: str) -> dict:
                     "sqs:ReceiveMessage",
                     "sqs:DeleteMessage",
                     "sqs:PurgeQueue",
-                    "sqs:ListQueues"
+                    "sqs:ListQueues",
+                    "sqs:TagQueue",
+                    "sqs:UntagQueue",
+                    "sqs:ListQueueTags"
                 ],
                 "Resource": "*"
             },
