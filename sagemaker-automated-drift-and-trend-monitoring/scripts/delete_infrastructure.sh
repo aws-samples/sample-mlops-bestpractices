@@ -8,7 +8,7 @@ set -e
 # Lambda IAM roles, the monitoring-writer Lambda, the SageMaker domain, S3
 # buckets, Athena database. Those are torn down by:
 #
-#     ./cloudformation/delete_stack.sh
+#     ./cloudformation/delete-main-stack.sh
 #
 # This script tears down what `deploy_lambda_container.sh` and
 # `create_cloudwatch_monitoring.py` create OUTSIDE CFN:
@@ -19,7 +19,7 @@ set -e
 #   4. ECR repository for the drift-monitor image  (optional — pass --ecr)
 #   5. CloudWatch dashboard + alarms (Section 6.6 of notebook 3)
 #
-# Run this BEFORE delete_stack.sh — the stack delete refuses to proceed if
+# Run this BEFORE delete-main-stack.sh — the stack delete refuses to proceed if
 # the drift Lambda still exists, because the Lambda's execution role and
 # the SQS queue + SNS topic it references are all CFN-owned. Killing this
 # Lambda first lets CFN tear those dependencies down cleanly.
@@ -196,5 +196,5 @@ else
     echo "Next: tear down everything else (SageMaker domain, Lambda IAM roles,"
     echo "SQS, S3, Athena DB) by running:"
     echo ""
-    echo "    ./cloudformation/delete_stack.sh"
+    echo "    ./cloudformation/delete-main-stack.sh"
 fi

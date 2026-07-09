@@ -40,7 +40,7 @@ Parameters:
 
   GitHubBranch:
     Type: String
-    Default: 'testing'
+    Default: 'main'
     Description: Git branch to check out after cloning (must exist on the remote)
 
   LifecycleConfigVersion:
