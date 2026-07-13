@@ -58,22 +58,8 @@ DRIFTED_DATA_PATH = CSV_DRIFTED_DATA
 NUM_SAMPLES = DRIFT_GEN_NUM_SAMPLES
 RANDOM_STATE = DRIFT_GEN_RANDOM_STATE
 
-# Drift parameters for key features (now read from config.yaml drift_generation.default_drift)
+# Drift parameters for key features (read from config.yaml drift_generation.default_drift)
 DRIFT_CONFIG = DRIFT_GEN_DEFAULT_CONFIG
-
-# Add default descriptions if not in config
-_FEATURE_DESCRIPTIONS = {
-    "transaction_amount": "Increased transaction amounts (inflation/behavior change)",
-    "transaction_timestamp": "Time shift to simulate future period",
-    "distance_from_home_km": "Increased distance from home (travel/remote transactions)",
-    "velocity_score": "Higher transaction velocity (more active users)",
-    "num_transactions_24h": "More transactions per day"
-}
-
-# Add descriptions to config entries if missing
-for feature, desc in _FEATURE_DESCRIPTIONS.items():
-    if feature in DRIFT_CONFIG and "description" not in DRIFT_CONFIG[feature]:
-        DRIFT_CONFIG[feature]["description"] = desc
 
 
 def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
@@ -121,12 +107,12 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
     else:
         raise ValueError(f"Unknown drift type: {drift_type}")
 
-    # Ensure non-negative values for certain features
-    if feature in ["transaction_amount", "distance_from_home_km", "velocity_score", "num_transactions_24h"]:
+    # Clip to zero: preserve non-negativity for any feature that was originally non-negative
+    if (original_values >= 0).all():
         drifted_values = np.maximum(drifted_values, 0)
 
-    # Round integer features
-    if feature == "num_transactions_24h":
+    # Preserve integer dtype if the original feature was integer-valued
+    if np.issubdtype(df[feature].dtype, np.integer) or (original_values == np.floor(original_values)).all():
         drifted_values = np.round(drifted_values).astype(int)
 
     df[feature] = drifted_values
@@ -140,8 +126,8 @@ def apply_drift(df: pd.DataFrame, feature: str, config: dict) -> pd.DataFrame:
     print(f"    Original mean: {original_mean:.4f}")
     print(f"    Drifted mean: {drifted_mean:.4f}")
     print(f"    Change: {pct_change:+.2f}%")
-    if "description" in config:
-        print(f"    Description: {config['description']}")
+    description = config.get("description", feature)
+    print(f"    Description: {description}")
 
     return df
 

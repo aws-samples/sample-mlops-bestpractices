@@ -38,7 +38,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent.parent / '.env')
 
-from src.config.config import ATHENA_DATABASE, ATHENA_INFERENCE_TABLE, ATHENA_GROUND_TRUTH_UPDATES_TABLE
+from src.config import schema
+from src.config.config import (
+    ATHENA_DATABASE,
+    ATHENA_INFERENCE_TABLE,
+    ATHENA_GROUND_TRUTH_UPDATES_TABLE,
+    PROBABILITY_COLUMN,
+)
 from src.train_pipeline.athena.athena_client import AthenaClient
 
 logging.basicConfig(
@@ -46,6 +52,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Schema-driven column name for ground truth
+ACTUAL_TARGET_COL = f'actual_{schema.target_column()}'
 
 
 class GroundTruthSimulator:
@@ -56,8 +65,8 @@ class GroundTruthSimulator:
         athena_client: AthenaClient,
         endpoint_name: str = None,
         accuracy: float = 0.85,
-        fraud_confirmation_days: tuple = (1, 7),
-        non_fraud_confirmation_days: tuple = (1, 30),
+        positive_confirmation_days: tuple = (1, 7),
+        negative_confirmation_days: tuple = (1, 30),
         feature_drift_impact: float = 0.0,
         model_drift_magnitude: float = 0.0,
         seed: int = 42,
@@ -69,8 +78,8 @@ class GroundTruthSimulator:
             athena_client: Athena client for queries
             endpoint_name: Optional filter for specific endpoint
             accuracy: Base model accuracy (0.0-1.0)
-            fraud_confirmation_days: (min, max) days for fraud confirmation
-            non_fraud_confirmation_days: (min, max) days for non-fraud confirmation
+            positive_confirmation_days: (min, max) days for positive class confirmation
+            negative_confirmation_days: (min, max) days for negative class confirmation
             feature_drift_impact: Accuracy reduction due to feature drift (0.0-1.0)
             model_drift_magnitude: Direct model accuracy degradation (0.0-1.0)
             seed: Random seed for reproducibility
@@ -80,8 +89,8 @@ class GroundTruthSimulator:
         self.client = athena_client
         self.endpoint_name = endpoint_name
         self.accuracy = accuracy
-        self.fraud_confirmation_days = fraud_confirmation_days
-        self.non_fraud_confirmation_days = non_fraud_confirmation_days
+        self.positive_confirmation_days = positive_confirmation_days
+        self.negative_confirmation_days = negative_confirmation_days
         self.feature_drift_impact = feature_drift_impact
         self.model_drift_magnitude = model_drift_magnitude
 
@@ -109,7 +118,7 @@ class GroundTruthSimulator:
             CAST(request_timestamp AS TIMESTAMP(3)) as request_timestamp,
             endpoint_name,
             prediction,
-            probability_fraud,
+            {PROBABILITY_COLUMN},
             confidence_score
         FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
         WHERE ground_truth IS NULL
@@ -130,8 +139,8 @@ class GroundTruthSimulator:
             return df
 
         logger.info(f"Loaded {len(df):,} predictions without ground truth")
-        logger.info(f"  Predicted fraud: {(df['prediction'] == 1).sum():,}")
-        logger.info(f"  Predicted non-fraud: {(df['prediction'] == 0).sum():,}")
+        logger.info(f"  Predicted positive class: {(df['prediction'] == 1).sum():,}")
+        logger.info(f"  Predicted negative class: {(df['prediction'] == 0).sum():,}")
 
         return df
 
@@ -156,7 +165,7 @@ class GroundTruthSimulator:
         df = df.copy()
 
         # Start with predictions as ground truth (perfect accuracy)
-        df['actual_fraud'] = df['prediction'].astype(bool)
+        df[ACTUAL_TARGET_COL] = df['prediction'].astype(bool)
 
         # Introduce errors to reach target effective accuracy
         error_rate = 1.0 - self.effective_accuracy
@@ -167,67 +176,67 @@ class GroundTruthSimulator:
             error_indices = np.random.choice(df.index, size=num_errors, replace=False)
 
             # Flip the ground truth for these errors
-            df.loc[error_indices, 'actual_fraud'] = ~df.loc[error_indices, 'actual_fraud']
+            df.loc[error_indices, ACTUAL_TARGET_COL] = ~df.loc[error_indices, ACTUAL_TARGET_COL]
 
             # Calculate error types
-            false_positives = ((df['prediction'] == 1) & (~df['actual_fraud'])).sum()
-            false_negatives = ((df['prediction'] == 0) & (df['actual_fraud'])).sum()
+            false_positives = ((df['prediction'] == 1) & (~df[ACTUAL_TARGET_COL])).sum()
+            false_negatives = ((df['prediction'] == 0) & (df[ACTUAL_TARGET_COL])).sum()
 
             logger.info(f"  Introduced {num_errors:,} errors:")
             logger.info(f"    False positives: {false_positives:,}")
             logger.info(f"    False negatives: {false_negatives:,}")
 
         # Calculate flags
-        df['false_positive'] = (df['prediction'] == 1) & (~df['actual_fraud'])
-        df['false_negative'] = (df['prediction'] == 0) & (df['actual_fraud'])
+        df['false_positive'] = (df['prediction'] == 1) & (~df[ACTUAL_TARGET_COL])
+        df['false_negative'] = (df['prediction'] == 0) & (df[ACTUAL_TARGET_COL])
 
         # Log statistics
-        actual_fraud_count = df['actual_fraud'].sum()
+        actual_positive_count = df[ACTUAL_TARGET_COL].sum()
         logger.info(f"\nSimulated ground truth statistics:")
         logger.info(f"  Total: {len(df):,}")
-        logger.info(f"  Actual fraud: {actual_fraud_count:,} ({actual_fraud_count/len(df)*100:.2f}%)")
-        logger.info(f"  Actual non-fraud: {(~df['actual_fraud']).sum():,}")
+        logger.info(f"  Actual positive class: {actual_positive_count:,} ({actual_positive_count/len(df)*100:.2f}%)")
+        logger.info(f"  Actual negative class: {(~df[ACTUAL_TARGET_COL]).sum():,}")
 
         return df
 
     def assign_confirmation_timestamps(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Assign realistic confirmation timestamps based on fraud status."""
+        """Assign realistic confirmation timestamps based on class label."""
         logger.info("Assigning confirmation timestamps...")
 
         df = df.copy()
 
-        # Fraud cases: faster confirmation (1-7 days)
-        fraud_mask = df['actual_fraud']
-        if fraud_mask.any():
-            fraud_delays = np.random.uniform(
-                self.fraud_confirmation_days[0],
-                self.fraud_confirmation_days[1],
-                size=fraud_mask.sum()
+        # Positive class cases: faster confirmation (1-7 days)
+        positive_mask = df[ACTUAL_TARGET_COL]
+        if positive_mask.any():
+            positive_delays = np.random.uniform(
+                self.positive_confirmation_days[0],
+                self.positive_confirmation_days[1],
+                size=positive_mask.sum()
             )
-            df.loc[fraud_mask, 'days_since_prediction'] = fraud_delays
+            df.loc[positive_mask, 'days_since_prediction'] = positive_delays
 
-        # Non-fraud cases: slower confirmation (1-30 days)
-        non_fraud_mask = ~fraud_mask
-        if non_fraud_mask.any():
-            non_fraud_delays = np.random.uniform(
-                self.non_fraud_confirmation_days[0],
-                self.non_fraud_confirmation_days[1],
-                size=non_fraud_mask.sum()
+        # Negative class cases: slower confirmation (1-30 days)
+        negative_mask = ~positive_mask
+        if negative_mask.any():
+            negative_delays = np.random.uniform(
+                self.negative_confirmation_days[0],
+                self.negative_confirmation_days[1],
+                size=negative_mask.sum()
             )
-            df.loc[non_fraud_mask, 'days_since_prediction'] = non_fraud_delays
+            df.loc[negative_mask, 'days_since_prediction'] = negative_delays
 
         # Calculate confirmation timestamp
         df['confirmation_timestamp'] = pd.to_datetime(df['request_timestamp']) + pd.to_timedelta(
             df['days_since_prediction'], unit='D'
         )
 
-        logger.info(f"  Fraud confirmation delay: {fraud_delays.mean():.1f} days (avg)" if fraud_mask.any() else "  No fraud cases")
-        logger.info(f"  Non-fraud confirmation delay: {non_fraud_delays.mean():.1f} days (avg)" if non_fraud_mask.any() else "  No non-fraud cases")
+        logger.info(f"  Positive class confirmation delay: {positive_delays.mean():.1f} days (avg)" if positive_mask.any() else "  No positive class cases")
+        logger.info(f"  Negative class confirmation delay: {negative_delays.mean():.1f} days (avg)" if negative_mask.any() else "  No negative class cases")
 
         return df
 
     def assign_confirmation_sources(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Assign confirmation sources based on fraud status."""
+        """Assign confirmation sources based on class label."""
         logger.info("Assigning confirmation sources...")
 
         df = df.copy()
@@ -246,16 +255,16 @@ class GroundTruthSimulator:
             'transaction_completed',
         ]
 
-        fraud_mask = df['actual_fraud']
-        df.loc[fraud_mask, 'confirmation_source'] = np.random.choice(
+        positive_mask = df[ACTUAL_TARGET_COL]
+        df.loc[positive_mask, 'confirmation_source'] = np.random.choice(
             fraud_sources,
-            size=fraud_mask.sum()
+            size=positive_mask.sum()
         )
 
-        non_fraud_mask = ~fraud_mask
-        df.loc[non_fraud_mask, 'confirmation_source'] = np.random.choice(
+        negative_mask = ~positive_mask
+        df.loc[negative_mask, 'confirmation_source'] = np.random.choice(
             non_fraud_sources,
-            size=non_fraud_mask.sum()
+            size=negative_mask.sum()
         )
 
         return df
@@ -274,7 +283,7 @@ class GroundTruthSimulator:
         updates = pd.DataFrame({
             'transaction_id': df['transaction_id'],
             'inference_id': df['inference_id'],
-            'actual_fraud': df['actual_fraud'],
+            ACTUAL_TARGET_COL: df[ACTUAL_TARGET_COL],
             'confirmation_timestamp': df['confirmation_timestamp'],
             'confirmation_source': df['confirmation_source'],
             'transaction_timestamp': pd.to_datetime(df['request_timestamp']),
@@ -282,7 +291,7 @@ class GroundTruthSimulator:
             'days_since_transaction': df['days_since_prediction'],  # Same as prediction in this case
             'days_since_prediction': df['days_since_prediction'],
             'investigation_notes': df.apply(self._generate_note, axis=1),
-            'investigation_priority': df['actual_fraud'].apply(lambda x: 'high' if x else 'low'),
+            'investigation_priority': df[ACTUAL_TARGET_COL].apply(lambda x: 'high' if x else 'low'),
             'false_positive': df['false_positive'],
             'false_negative': df['false_negative'],
             'window_id': np.int32(1),  # Default window
@@ -343,7 +352,7 @@ class GroundTruthSimulator:
             return {
                 'total_predictions': 0,
                 'updates_created': 0,
-                'actual_fraud': 0,
+                'actual_positive': 0,
                 'false_positives': 0,
                 'false_negatives': 0,
                 'accuracy': self.accuracy,
@@ -362,7 +371,7 @@ class GroundTruthSimulator:
         stats = {
             'total_predictions': len(df),
             'updates_created': len(updates),
-            'actual_fraud': int(df['actual_fraud'].sum()),
+            'actual_positive': int(df[ACTUAL_TARGET_COL].sum()),
             'false_positives': int(df['false_positive'].sum()),
             'false_negatives': int(df['false_negative'].sum()),
             'accuracy': self.accuracy,
@@ -373,7 +382,7 @@ class GroundTruthSimulator:
         logger.info("=" * 80)
         logger.info(f"  Total predictions processed: {stats['total_predictions']:,}")
         logger.info(f"  Ground truth updates created: {stats['updates_created']:,}")
-        logger.info(f"  Actual fraud: {stats['actual_fraud']:,} ({stats['actual_fraud']/stats['total_predictions']*100:.2f}%)")
+        logger.info(f"  Actual positive class: {stats['actual_positive']:,} ({stats['actual_positive']/stats['total_predictions']*100:.2f}%)")
         logger.info(f"  False positives: {stats['false_positives']:,}")
         logger.info(f"  False negatives: {stats['false_negatives']:,}")
         logger.info(f"  Model accuracy: {stats['accuracy']*100:.1f}%")
@@ -404,16 +413,16 @@ def main():
         help='Limit number of predictions to process'
     )
     parser.add_argument(
-        '--fraud-days',
+        '--positive-days',
         type=str,
         default='1,7',
-        help='Fraud confirmation delay range in days (min,max, default: 1,7)'
+        help='Positive class confirmation delay range in days (min,max, default: 1,7)'
     )
     parser.add_argument(
-        '--non-fraud-days',
+        '--negative-days',
         type=str,
         default='1,30',
-        help='Non-fraud confirmation delay range in days (min,max, default: 1,30)'
+        help='Negative class confirmation delay range in days (min,max, default: 1,30)'
     )
     parser.add_argument(
         '--seed',
@@ -425,8 +434,8 @@ def main():
     args = parser.parse_args()
 
     # Parse day ranges
-    fraud_days = tuple(map(int, args.fraud_days.split(',')))
-    non_fraud_days = tuple(map(int, args.non_fraud_days.split(',')))
+    positive_days = tuple(map(int, args.positive_days.split(',')))
+    negative_days = tuple(map(int, args.negative_days.split(',')))
 
     # Initialize Athena client
     athena_client = AthenaClient()
@@ -436,8 +445,8 @@ def main():
         athena_client=athena_client,
         endpoint_name=args.endpoint_name,
         accuracy=args.accuracy,
-        fraud_confirmation_days=fraud_days,
-        non_fraud_confirmation_days=non_fraud_days,
+        positive_confirmation_days=positive_days,
+        negative_confirmation_days=negative_days,
         seed=args.seed,
     )
 

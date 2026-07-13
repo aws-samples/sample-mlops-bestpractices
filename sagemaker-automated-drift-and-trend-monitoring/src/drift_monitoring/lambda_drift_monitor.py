@@ -47,10 +47,10 @@ sqs = boto3.client('sqs')
 sagemaker_client = boto3.client('sagemaker')
 
 # Configuration from environment variables
-ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
-ATHENA_OUTPUT_S3 = os.getenv('ATHENA_OUTPUT_S3', 's3://fraud-detection-data-lake/athena-query-results/')
+ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'ml_monitoring')
+ATHENA_OUTPUT_S3 = os.getenv('ATHENA_OUTPUT_S3', 's3://ml-monitoring-data/athena-query-results/')
 ATHENA_EVALUATION_TABLE = os.getenv('ATHENA_EVALUATION_TABLE', 'evaluation_data')
-MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'fraud-detection')
+MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'ml-model')
 SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
 MONITORING_SQS_QUEUE_URL = os.getenv('MONITORING_SQS_QUEUE_URL', '')
@@ -78,7 +78,7 @@ TRAINING_FEATURES = schema.feature_names()
 # reference implementation.
 TARGET_COLUMN = os.getenv('TARGET_COLUMN', schema.target_column())
 PREDICTION_COLUMN = os.getenv('PREDICTION_COLUMN', 'prediction')
-PROBABILITY_COLUMN = os.getenv('PROBABILITY_COLUMN', 'probability_fraud')
+PROBABILITY_COLUMN = os.getenv('PROBABILITY_COLUMN', 'probability_positive')
 
 
 def execute_athena_query(sql, wait=True):
@@ -528,12 +528,12 @@ def check_model_drift():
 
     # SELECT the config-driven prediction/probability columns and alias them
     # to stable in-Python names so the rest of this function keeps using
-    # `prediction` and `probability_fraud` regardless of the actual Athena
+    # `prediction` and `probability_positive` regardless of the actual Athena
     # column names in a BYO deployment.
     performance_sql = f"""
     SELECT
         {PREDICTION_COLUMN} AS prediction,
-        {PROBABILITY_COLUMN} AS probability_fraud,
+        {PROBABILITY_COLUMN} AS probability_positive,
         ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
@@ -553,14 +553,14 @@ def check_model_drift():
     current_df = pd.DataFrame(recent_performance)
     current_df['ground_truth'] = current_df['ground_truth'].astype(int)
     current_df['prediction'] = current_df['prediction'].astype(int)
-    current_df['probability_fraud'] = current_df['probability_fraud'].astype(float)
+    current_df['probability_positive'] = current_df['probability_positive'].astype(float)
 
     # Compute sklearn metrics for the SNS alert / response payload
     from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 
     y_true = current_df['ground_truth'].values
     y_pred = current_df['prediction'].values
-    y_prob = current_df['probability_fraud'].values
+    y_prob = current_df['probability_positive'].values
 
     current_roc_auc = roc_auc_score(y_true, y_prob)
     current_accuracy = accuracy_score(y_true, y_pred)
@@ -599,7 +599,7 @@ def check_model_drift():
     baseline_sql = f"""
     SELECT
         {PREDICTION_COLUMN} AS prediction,
-        {PROBABILITY_COLUMN} AS probability_fraud,
+        {PROBABILITY_COLUMN} AS probability_positive,
         ground_truth
     FROM {ATHENA_DATABASE}.inference_responses
     WHERE ground_truth IS NOT NULL
@@ -614,7 +614,7 @@ def check_model_drift():
             baseline_df = pd.DataFrame(baseline_data)
             baseline_df['ground_truth'] = baseline_df['ground_truth'].astype(int)
             baseline_df['prediction'] = baseline_df['prediction'].astype(int)
-            baseline_df['probability_fraud'] = baseline_df['probability_fraud'].astype(float)
+            baseline_df['probability_positive'] = baseline_df['probability_positive'].astype(float)
         else:
             # Fall back: duplicate current as baseline (report still generates)
             baseline_df = current_df.copy()
@@ -693,7 +693,7 @@ def send_sns_alert(data_drift_result, model_drift_result):
         return
 
     # Build alert message
-    subject = "🚨 ML Model Drift Alert - Fraud Detection"
+    subject = f"🚨 ML Model Drift Alert - {os.getenv('PROJECT_NAME', 'ML Monitoring')}"
 
     message_lines = [
         "=" * 80,
@@ -899,7 +899,7 @@ def log_to_mlflow(data_drift_result, model_drift_result):
 
     try:
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        mlflow.set_experiment("fraud-detection-drift_monitoring")
+        mlflow.set_experiment(os.getenv('MLFLOW_MONITORING_EXPERIMENT', 'ml-model-monitoring'))
 
         with mlflow.start_run(run_name=f"drift-check-{datetime.now().strftime('%Y%m%d-%H%M%S')}") as run:
             # Capture the run ID
@@ -1064,7 +1064,7 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     record = {
         'monitoring_run_id': run_id,
         'monitoring_timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-        'endpoint_name': ENDPOINT_NAME or os.getenv('ENDPOINT_NAME', 'fraud-detector-endpoint'),
+        'endpoint_name': ENDPOINT_NAME or os.getenv('ENDPOINT_NAME', 'ml-model-endpoint'),
         'model_version': os.getenv('MODEL_VERSION', 'latest'),
         'model_package_arn': model_package_arn,
         'evaluation_snapshot_id': evaluation_snapshot_id,

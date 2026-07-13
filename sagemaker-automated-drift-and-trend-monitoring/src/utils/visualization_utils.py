@@ -1,5 +1,5 @@
 """
-Visualization utilities for fraud detection pipeline.
+Visualization utilities for ML monitoring pipeline.
 
 Creates charts from Athena data and logs to MLflow for monitoring:
 - ROC curves
@@ -19,6 +19,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import roc_curve, auc, confusion_matrix
+
+from src.config.config import ATHENA_DATABASE, PROBABILITY_COLUMN, ATHENA_INFERENCE_TABLE
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +62,8 @@ def create_roc_curve_from_athena(
     query = f"""
     SELECT
         ground_truth,
-        probability_fraud
-    FROM fraud_detection.inference_responses
+        {PROBABILITY_COLUMN}
+    FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
     WHERE endpoint_name = '{endpoint_name}'
       AND ground_truth IS NOT NULL
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
@@ -82,7 +84,7 @@ def create_roc_curve_from_athena(
 
     # Calculate ROC curve
     y_true = df['ground_truth'].values
-    y_scores = df['probability_fraud'].values
+    y_scores = df[PROBABILITY_COLUMN].values
 
     fpr, tpr, thresholds = roc_curve(y_true, y_scores)
     roc_auc = auc(fpr, tpr)
@@ -154,9 +156,9 @@ def create_confusion_matrix_from_athena(
     query = f"""
     SELECT
         ground_truth,
-        probability_fraud,
+        {PROBABILITY_COLUMN},
         prediction
-    FROM fraud_detection.inference_responses
+    FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
     WHERE endpoint_name = '{endpoint_name}'
       AND ground_truth IS NOT NULL
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
@@ -175,7 +177,7 @@ def create_confusion_matrix_from_athena(
 
     # Calculate predictions based on threshold
     y_true = df['ground_truth'].values
-    y_pred = (df['probability_fraud'].values >= threshold).astype(int)
+    y_pred = (df[PROBABILITY_COLUMN].values >= threshold).astype(int)
 
     # Calculate confusion matrix
     cm = confusion_matrix(y_true, y_pred)
@@ -201,8 +203,8 @@ def create_confusion_matrix_from_athena(
     ax.set_title(f'Confusion Matrix - {endpoint_name}\n'
                 f'Threshold: {threshold:.2f} | Accuracy: {accuracy:.3f}',
                 fontsize=14, fontweight='bold')
-    ax.set_xticklabels(['Non-Fraud', 'Fraud'])
-    ax.set_yticklabels(['Non-Fraud', 'Fraud'])
+    ax.set_xticklabels(['Negative Class', 'Positive Class'])
+    ax.set_yticklabels(['Negative Class', 'Positive Class'])
 
     # Add metrics text
     metrics_text = (f'Precision: {precision:.3f}\n'
@@ -282,10 +284,10 @@ def create_prediction_distribution(
     SELECT
         {trunc_func} as time_bucket,
         COUNT(*) as total_predictions,
-        SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as fraud_predictions,
-        AVG(probability_fraud) as avg_fraud_prob,
+        SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as positive_predictions,
+        AVG({PROBABILITY_COLUMN}) as avg_positive_prob,
         AVG(confidence_score) as avg_confidence
-    FROM fraud_detection.inference_responses
+    FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
                                 AND TIMESTAMP '{end_date.isoformat()}'
@@ -317,25 +319,25 @@ def create_prediction_distribution(
                  fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3)
 
-    # Plot 2: Fraud vs Non-Fraud predictions
-    ax2.bar(df['time_bucket'], df['fraud_predictions'],
-           label='Fraud Predictions', color='red', alpha=0.7)
-    ax2.bar(df['time_bucket'], df['total_predictions'] - df['fraud_predictions'],
-           bottom=df['fraud_predictions'],
-           label='Non-Fraud Predictions', color='green', alpha=0.7)
+    # Plot 2: Positive vs Negative Class predictions
+    ax2.bar(df['time_bucket'], df['positive_predictions'],
+           label='Positive Class Predictions', color='red', alpha=0.7)
+    ax2.bar(df['time_bucket'], df['total_predictions'] - df['positive_predictions'],
+           bottom=df['positive_predictions'],
+           label='Negative Class Predictions', color='green', alpha=0.7)
     ax2.set_ylabel('Prediction Count', fontsize=11)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
-    # Plot 3: Average fraud probability and confidence
+    # Plot 3: Average positive probability and confidence
     ax3_twin = ax3.twinx()
-    line1 = ax3.plot(df['time_bucket'], df['avg_fraud_prob'],
+    line1 = ax3.plot(df['time_bucket'], df['avg_positive_prob'],
                     marker='s', linewidth=2, markersize=5,
-                    color='orange', label='Avg Fraud Probability')
+                    color='orange', label='Avg Positive Probability')
     line2 = ax3_twin.plot(df['time_bucket'], df['avg_confidence'],
                          marker='^', linewidth=2, markersize=5,
                          color='purple', label='Avg Confidence')
-    ax3.set_ylabel('Avg Fraud Probability', fontsize=11, color='orange')
+    ax3.set_ylabel('Avg Positive Probability', fontsize=11, color='orange')
     ax3_twin.set_ylabel('Avg Confidence Score', fontsize=11, color='purple')
     ax3.set_xlabel('Time', fontsize=11)
     ax3.tick_params(axis='y', labelcolor='orange')
@@ -359,8 +361,8 @@ def create_prediction_distribution(
 
     metrics = {
         'total_predictions': int(df['total_predictions'].sum()),
-        'total_fraud_predictions': int(df['fraud_predictions'].sum()),
-        'avg_fraud_probability': float(df['avg_fraud_prob'].mean()),
+        'total_positive_predictions': int(df['positive_predictions'].sum()),
+        'avg_positive_probability': float(df['avg_positive_prob'].mean()),
         'avg_confidence': float(df['avg_confidence'].mean()),
         'time_periods': len(df),
     }
@@ -399,7 +401,7 @@ def create_latency_heatmap(
         AVG(inference_latency_ms) as avg_latency,
         STDDEV(inference_latency_ms) as std_latency,
         COUNT(*) as request_count
-    FROM fraud_detection.inference_responses
+    FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp > CURRENT_TIMESTAMP - INTERVAL '{days}' DAY
     GROUP BY DATE_TRUNC('day', request_timestamp), EXTRACT(HOUR FROM request_timestamp)
@@ -489,7 +491,7 @@ def create_confidence_distribution(
         prediction,
         is_high_confidence,
         is_low_confidence
-    FROM fraud_detection.inference_responses
+    FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
                                 AND TIMESTAMP '{end_date.isoformat()}'
@@ -523,12 +525,12 @@ def create_confidence_distribution(
     ax1.grid(True, alpha=0.3)
 
     # Plot 2: Confidence by prediction
-    fraud_conf = df[df['prediction'] == 1]['confidence_score']
-    non_fraud_conf = df[df['prediction'] == 0]['confidence_score']
+    positive_conf = df[df['prediction'] == 1]['confidence_score']
+    negative_conf = df[df['prediction'] == 0]['confidence_score']
 
-    ax2.hist([non_fraud_conf, fraud_conf], bins=30,
+    ax2.hist([negative_conf, positive_conf], bins=30,
             color=['green', 'red'], alpha=0.6,
-            label=['Non-Fraud', 'Fraud'], edgecolor='black')
+            label=['Negative Class', 'Positive Class'], edgecolor='black')
     ax2.set_xlabel('Confidence Score', fontsize=12)
     ax2.set_ylabel('Frequency', fontsize=12)
     ax2.set_title('Confidence by Prediction', fontsize=13, fontweight='bold')

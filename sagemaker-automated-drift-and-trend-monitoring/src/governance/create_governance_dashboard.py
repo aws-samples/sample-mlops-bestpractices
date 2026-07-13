@@ -643,7 +643,7 @@ def create_inference_dataset(
                     # (PREDICTION_COLUMN / PROBABILITY_COLUMN / PROBABILITY_ALT_COLUMN)
                     # so BYO users whose inference handler emits differently
                     # named columns don't have to edit this file. Defaults
-                    # match the fraud-detection reference implementation.
+                    # match the reference implementation.
                     {'Name': PREDICTION_COLUMN, 'Type': 'INTEGER'},
                     {'Name': PROBABILITY_COLUMN, 'Type': 'DECIMAL'},
                     *([{'Name': PROBABILITY_ALT_COLUMN, 'Type': 'DECIMAL'}]
@@ -899,7 +899,7 @@ def create_feature_drift_dataset(
     CustomSql joining `monitoring_responses` to `inference_responses` on
     the exact foreign key `monitoring_run_id` (back-filled by the drift
     Lambda on every inference row it scored) to aggregate inference counts
-    + avg fraud probability alongside per-run drift metrics.
+    + avg positive-class probability alongside per-run drift metrics.
 
     Args:
         datasource_arn: ARN of the Athena data source
@@ -930,7 +930,7 @@ def create_feature_drift_dataset(
 
     # Feature drift dataset — joins monitoring_responses to inference_responses
     # by monitoring_run_id (foreign key the drift Lambda back-fills on each
-    # inference row it scored). Aggregates inference counts + avg fraud prob
+    # inference row it scored). Aggregates inference counts + avg positive prob
     # alongside the per-run drift metrics so dashboards can slice both sides
     # of the drift <-> inference relationship in a single dataset.
     custom_sql = f'''
@@ -953,7 +953,7 @@ SELECT
     COUNT(DISTINCT i.inference_id) as inference_count,
     -- avg_score = AVG of the probability/score column. Aliased so the
     -- dashboard doesn't have to know the physical column name.
-    AVG(i.{PROBABILITY_COLUMN}) as avg_fraud_prob,
+    AVG(i.{PROBABILITY_COLUMN}) as avg_positive_prob,
     COUNT(CASE WHEN i.ground_truth IS NOT NULL THEN 1 END) as gt_count,
     MIN(i.request_timestamp) as window_start,
     MAX(i.request_timestamp) as window_end
@@ -992,7 +992,7 @@ ORDER BY m.monitoring_timestamp DESC
                     {'Name': 'recall', 'Type': 'DECIMAL'},
                     {'Name': 'f1_score', 'Type': 'DECIMAL'},
                     {'Name': 'inference_count', 'Type': 'INTEGER'},
-                    {'Name': 'avg_fraud_prob', 'Type': 'DECIMAL'},
+                    {'Name': 'avg_positive_prob', 'Type': 'DECIMAL'},
                     {'Name': 'gt_count', 'Type': 'INTEGER'},
                     # Earliest / latest request_timestamp seen for this drift run.
                     # Lets visuals show "this run scored inferences from <start> to <end>".
@@ -1347,17 +1347,17 @@ SELECT
     i.inference_id,
     i.endpoint_name,
     i.model_version,
-    i.prediction as predicted_fraud,
-    CAST(g.actual_fraud AS INT) as actual_fraud,
+    i.{PREDICTION_COLUMN} as predicted_positive,
+    CAST(g.actual_target AS INT) as actual_target,
     CASE 
-        WHEN i.prediction = CAST(g.actual_fraud AS INT) THEN 1 
+        WHEN i.{PREDICTION_COLUMN} = CAST(g.actual_target AS INT) THEN 1 
         ELSE 0 
     END as prediction_match,
     CASE
-        WHEN i.prediction = 1 AND CAST(g.actual_fraud AS INT) = 1 THEN 'True Positive'
-        WHEN i.prediction = 0 AND CAST(g.actual_fraud AS INT) = 0 THEN 'True Negative'
-        WHEN i.prediction = 1 AND CAST(g.actual_fraud AS INT) = 0 THEN 'False Positive'
-        WHEN i.prediction = 0 AND CAST(g.actual_fraud AS INT) = 1 THEN 'False Negative'
+        WHEN i.{PREDICTION_COLUMN} = 1 AND CAST(g.actual_target AS INT) = 1 THEN 'True Positive'
+        WHEN i.{PREDICTION_COLUMN} = 0 AND CAST(g.actual_target AS INT) = 0 THEN 'True Negative'
+        WHEN i.{PREDICTION_COLUMN} = 1 AND CAST(g.actual_target AS INT) = 0 THEN 'False Positive'
+        WHEN i.{PREDICTION_COLUMN} = 0 AND CAST(g.actual_target AS INT) = 1 THEN 'False Negative'
         ELSE 'Unknown'
     END as prediction_category,
     i.request_timestamp as prediction_time,
@@ -1367,7 +1367,7 @@ FROM {resolved_database}.inference_responses i
 INNER JOIN {resolved_database}.ground_truth_updates g
     ON i.inference_id = g.inference_id
 WHERE i.request_timestamp >= CURRENT_DATE - INTERVAL '30' DAY
-    AND g.actual_fraud IS NOT NULL
+    AND g.actual_target IS NOT NULL
 ORDER BY i.request_timestamp DESC
 """
 
@@ -1382,8 +1382,8 @@ ORDER BY i.request_timestamp DESC
                     {'Name': 'inference_id', 'Type': 'STRING'},
                     {'Name': 'endpoint_name', 'Type': 'STRING'},
                     {'Name': 'model_version', 'Type': 'STRING'},
-                    {'Name': 'predicted_fraud', 'Type': 'INTEGER'},
-                    {'Name': 'actual_fraud', 'Type': 'INTEGER'},
+                    {'Name': 'predicted_positive', 'Type': 'INTEGER'},
+                    {'Name': 'actual_target', 'Type': 'INTEGER'},
                     {'Name': 'prediction_match', 'Type': 'INTEGER'},
                     {'Name': 'prediction_category', 'Type': 'STRING'},
                     {'Name': 'prediction_time', 'Type': 'DATETIME'},
@@ -1641,7 +1641,7 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
     # M9 — Confusion Matrix Over Time. Aggregate accuracy-join records
     # by day and prediction_category (TP/FP/TN/FN). Reveals *which* class
     # of error is trending: e.g. accuracy dips but only because false-negatives
-    # spiked, which for fraud detection matters far more than an accuracy
+    # spiked, which for classification tasks matters far more than an accuracy
     # bump from more true-negatives. Bound to the accuracy-join dataset
     # since that's where the confusion-category breakdown lives.
     def acol(name):
@@ -2162,7 +2162,7 @@ def _build_all_visuals() -> Dict[str, List[Dict[str, Any]]]:
 
     The dashboard was consolidated from an earlier 4-tab layout (which
     duplicated coverage across an "Inference Monitoring" sheet and
-    drift-analysis sheets, and carried fraud-domain-specific visuals
+    drift-analysis sheets, and carried domain-specific visuals
     irrelevant to drift). Each of the three tabs answers a single
     organizing question:
 

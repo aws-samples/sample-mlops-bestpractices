@@ -10,7 +10,7 @@
 # To bring your own dataset:
 #   1. Edit this file: identifier_column, target_column, and the full
 #      `features` list (name + type) for YOUR data.
-#   2. Point your own loader (replacing src/setup/download_kaggle_dataset.py)
+#   2. Point your own loader (replacing src/setup/download_dataset.py)
 #      at your source CSV/table so it emits rows in schema.csv_column_order().
 #   3. Recreate the Athena tables against the new schema:
 #         ./cloudformation/deploy-stack.sh --recreate-database
@@ -26,93 +26,80 @@
 
 dataset:
   # Unique row identifier. STRING in Athena regardless of source type.
-  identifier_column: transaction_id
+  # The Bank Marketing dataset has no natural ID, so we generate a synthetic
+  # one during data download (row index prefixed with 'bm-').
+  identifier_column: client_id
 
-  # Primary event timestamp. This names one entry in `features:` below —
-  # it IS a model feature (DOUBLE, matching the Kaggle "seconds since
-  # first transaction" encoding), not a separate excluded column. Some
-  # downstream tables (ground_truth, inference_responses) additionally
-  # have their own real TIMESTAMP partition columns (prediction_timestamp,
-  # request_timestamp) that are unrelated to this value.
-  timestamp_column: transaction_timestamp
+  # Primary event timestamp. For Bank Marketing, the 'day' and 'month'
+  # features partially encode timing but there's no single timestamp field.
+  # We use a synthetic timestamp generated at download time.
+  timestamp_column: contact_timestamp
 
   # Binary classification target. BOOLEAN in Athena; the training script
-  # casts to 0/1 internally.
-  target_column: is_fraud
+  # casts to 0/1 internally. Bank Marketing target: did the client subscribe
+  # to a term deposit? (original column 'y': yes/no)
+  target_column: subscribed
   target_type: boolean
 
   # Columns present in the source predictions CSV that are NOT model
   # features — carried through to training_data/evaluation_data/drifted_data
   # for auditability, but never passed to the model.
   auxiliary_columns:
-    - name: fraud_prediction
+    - name: prediction
       type: boolean
-    - name: fraud_probability
+    - name: probability_positive
       type: double
 
-  # Full feature list, in the order the pipeline expects them. Do not
-  # reorder existing entries when adding new features — appending is safe;
-  # reordering forces a full re-seed via --recreate-database.
+  # Full feature list, in the order the pipeline expects them.
+  # Bank Marketing (bank-additional-full.csv) features after label-encoding
+  # categorical columns. All types are DOUBLE after encoding.
+  #
+  # Numeric features (kept as-is):
+  #   age, duration, campaign, pdays, previous, emp.var.rate,
+  #   cons.price.idx, cons.conf.idx, euribor3m, nr.employed
+  # Categorical features (label-encoded to numeric):
+  #   job, marital, education, default, housing, loan, contact,
+  #   month, day_of_week, poutcome
   features:
-    - name: transaction_hour
+    - name: age
       type: double
-    - name: transaction_day_of_week
+    - name: job
       type: double
-    - name: transaction_amount
+    - name: marital
       type: double
-    - name: transaction_type_code
+    - name: education
       type: double
-    - name: customer_age
+    - name: credit_default
       type: double
-    - name: customer_gender
-      type: string
-    - name: customer_tenure_months
+    - name: housing
       type: double
-    - name: account_age_days
+    - name: loan
       type: double
-    - name: distance_from_home_km
+    - name: contact
       type: double
-    - name: distance_from_last_transaction_km
+    - name: month
       type: double
-    - name: time_since_last_transaction_min
+    - name: day_of_week
       type: double
-    - name: online_transaction
+    - name: duration
       type: double
-    - name: international_transaction
+    - name: campaign
       type: double
-    - name: high_risk_country
+    - name: pdays
       type: double
-    - name: merchant_category_code
+    - name: previous
       type: double
-    - name: merchant_reputation_score
+    - name: poutcome
       type: double
-    - name: chip_transaction
+    - name: emp_var_rate
       type: double
-    - name: pin_used
+    - name: cons_price_idx
       type: double
-    - name: card_present
+    - name: cons_conf_idx
       type: double
-    - name: cvv_match
+    - name: euribor3m
       type: double
-    - name: address_verification_match
-      type: double
-    - name: num_transactions_24h
-      type: double
-    - name: num_transactions_7days
-      type: double
-    - name: avg_transaction_amount_30days
-      type: double
-    - name: max_transaction_amount_30days
-      type: double
-    - name: velocity_score
-      type: double
-    - name: recurring_transaction
-      type: double
-    - name: previous_fraud_incidents
-      type: double
-    - name: credit_limit
-      type: double
-    - name: available_credit_ratio
+    - name: nr_employed
       type: double
 
   # Deterministic 80/20 train/eval split. `hash_column` is hashed
@@ -122,4 +109,4 @@ dataset:
   split:
     strategy: deterministic_hash
     train_ratio: 0.8
-    hash_column: transaction_id
+    hash_column: client_id

@@ -1,5 +1,5 @@
 """
-SageMaker Pipeline definition for fraud detection.
+SageMaker Pipeline definition for ML model training and deployment.
 
 This pipeline implements a complete ML workflow:
 1. ProcessingStep - Seed Athena training_data from predictions CSV (idempotent)
@@ -140,9 +140,9 @@ else:
     logger.info(f"MLflow tracking URI: {MLFLOW_TRACKING_URI}")
 
 
-class FraudDetectionPipeline:
+class MLTrainingPipeline:
     """
-    SageMaker Pipeline for fraud detection with end-to-end automation.
+    SageMaker Pipeline for ML model training with end-to-end automation.
     
     Pipeline Flow:
     1. Preprocess data from Athena
@@ -157,7 +157,7 @@ class FraudDetectionPipeline:
 
     def __init__(
         self,
-        pipeline_name: str = "fraud-detection-pipeline",
+        pipeline_name: str = "ml-training-pipeline",
         role: Optional[str] = None,
         region: str = "us-east-1",
         **kwargs
@@ -207,8 +207,8 @@ class FraudDetectionPipeline:
 
         # Lambda configuration
         self.lambda_config = {
-            'deploy_function_name': kwargs.get('deploy_lambda', 'fraud-detection-deploy-endpoint'),
-            'test_function_name': kwargs.get('test_lambda', 'fraud-detection-test-inference'),
+            'deploy_function_name': kwargs.get('deploy_lambda', 'ml-deploy-endpoint'),
+            'test_function_name': kwargs.get('test_lambda', 'ml-test-inference'),
             'lambda_timeout': kwargs.get('lambda_timeout', 600),
             'lambda_memory': kwargs.get('lambda_memory', 1024),
         }
@@ -291,7 +291,7 @@ class FraudDetectionPipeline:
             # Deployment parameters
             'endpoint_name': ParameterString(
                 name="EndpointName",
-                default_value="fraud-detector"
+                default_value="ml-model"
             ),
             'endpoint_memory_size': ParameterInteger(
                 name="EndpointMemorySize",
@@ -404,7 +404,7 @@ class FraudDetectionPipeline:
             role=self.role,
             instance_type=self.config['processing_instance_type'],
             instance_count=1,
-            base_job_name="fraud-seed-athena",
+            base_job_name="ml-seed-athena",
             sagemaker_session=self.session,
             command=["python3"],
             env={
@@ -504,7 +504,7 @@ class FraudDetectionPipeline:
         # The SageMaker Spark 3.3 container includes AWS Glue Data Catalog JARs
         # Glue config is set in SparkSession.builder in preprocessing_pyspark.py
         processor = PySparkProcessor(
-            base_job_name="fraud-preprocessing-spark",
+            base_job_name="ml-preprocessing-spark",
             framework_version="3.3",  # Spark version
             role=self.role,
             instance_type=self.config['processing_instance_type'],
@@ -629,7 +629,7 @@ class FraudDetectionPipeline:
             source_code=source_code,
             compute=compute,
             role=self.role,
-            base_job_name="fraud-training",
+            base_job_name="ml-training",
             output_data_config=OutputDataConfig(
                 s3_output_path=f"s3://{self.bucket}/fraud-detection/training/output"
             ),
@@ -713,7 +713,7 @@ class FraudDetectionPipeline:
             role=self.role,
             instance_type=self.config['processing_instance_type'],
             instance_count=1,
-            base_job_name="fraud-evaluation",
+            base_job_name="ml-evaluation",
             sagemaker_session=self.session,
             command=["python3"],
             env={
@@ -1245,7 +1245,7 @@ class FraudDetectionPipeline:
 
     def upsert_pipeline(
         self,
-        description: str = "Fraud detection pipeline with MLflow monitoring",
+        description: str = "ML training pipeline with MLflow monitoring",
         include_deployment: bool = True,
         tags: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
@@ -1271,7 +1271,7 @@ class FraudDetectionPipeline:
 
         # Define default tags
         default_tags = [
-            {'Key': 'Project', 'Value': 'FraudDetection'},
+            {'Key': 'Project', 'Value': 'MLTraining'},
             {'Key': 'ManagedBy', 'Value': 'SageMaker'},
             {'Key': 'MLflowIntegration', 'Value': 'true'},
             {'Key': 'IncludesDeployment', 'Value': str(include_deployment).lower()},
@@ -1351,14 +1351,14 @@ class FraudDetectionPipeline:
         return result
 
 
-def create_fraud_detection_pipeline(
-    pipeline_name: str = "fraud-detection-pipeline",
+def create_ml_training_pipeline(
+    pipeline_name: str = "ml-training-pipeline",
     region: str = "us-east-1",
     role: Optional[str] = None,
     **kwargs
-) -> FraudDetectionPipeline:
+) -> MLTrainingPipeline:
     """
-    Factory function to create fraud detection pipeline.
+    Factory function to create ML training pipeline.
 
     Args:
         pipeline_name: Pipeline name
@@ -1367,9 +1367,9 @@ def create_fraud_detection_pipeline(
         **kwargs: Additional configuration
 
     Returns:
-        FraudDetectionPipeline instance
+        MLTrainingPipeline instance
     """
-    return FraudDetectionPipeline(
+    return MLTrainingPipeline(
         pipeline_name=pipeline_name,
         region=region,
         role=role,
@@ -1382,7 +1382,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="Create SageMaker Pipeline")
-    parser.add_argument('--pipeline-name', default='fraud-detection-pipeline',
+    parser.add_argument('--pipeline-name', default='ml-training-pipeline',
                        help='Pipeline name')
     parser.add_argument('--region', default='us-east-1',
                        help='AWS region')
@@ -1398,7 +1398,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # Create pipeline
-    pipeline_builder = create_fraud_detection_pipeline(
+    pipeline_builder = create_ml_training_pipeline(
         pipeline_name=args.pipeline_name,
         region=args.region
     )

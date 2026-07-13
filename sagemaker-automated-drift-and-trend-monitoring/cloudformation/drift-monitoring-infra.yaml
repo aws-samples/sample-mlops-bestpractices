@@ -19,7 +19,7 @@ Description: >
 Parameters:
   ProjectName:
     Type: String
-    Default: 'fraud-detection'
+    Default: 'ml-monitoring'
     Description: 'Prefix for resource names/tags (lowercase letters, numbers, hyphens).'
     AllowedPattern: '^[a-z0-9-]+$'
 
@@ -31,7 +31,7 @@ Parameters:
 
   AthenaDatabase:
     Type: String
-    Default: 'fraud_detection'
+    Default: 'ml_monitoring'
     Description: 'Glue/Athena database that holds the Iceberg tables.'
 
   MonitoringTableName:
@@ -41,7 +41,7 @@ Parameters:
 
   EndpointName:
     Type: String
-    Default: 'fraud-detector-endpoint'
+    Default: 'ml-model-endpoint'
     Description: 'SageMaker endpoint being monitored (CloudWatch metric dimension).'
 
   AlertEmail:
@@ -64,22 +64,22 @@ Parameters:
 
   MonitoringQueueName:
     Type: String
-    Default: 'fraud-monitoring-results'
+    Default: 'ml-monitoring-results'
     Description: 'SQS queue the drift-monitor Lambda writes results to.'
 
   MonitoringWriterLambdaName:
     Type: String
-    Default: 'fraud-monitoring-results-writer'
+    Default: 'ml-monitoring-results-writer'
     Description: 'Name of the SQS->Athena monitoring-results writer Lambda.'
 
   SnsTopicName:
     Type: String
-    Default: 'fraud-detection-drift-alerts'
+    Default: 'ml-monitoring-drift-alerts'
     Description: 'SNS topic name for drift alerts.'
 
   DriftMonitorRoleName:
     Type: String
-    Default: 'fraud-detection-drift-monitor-role'
+    Default: 'ml-monitoring-drift-monitor-role'
     Description: >-
       IAM role name assumed by the scheduled (container) drift-monitor Lambda.
       scripts/deploy_lambda_container.sh reuses this exact role when it creates
@@ -87,12 +87,12 @@ Parameters:
 
   MetricNamespace:
     Type: String
-    Default: 'FraudDetection/DriftMonitoring'
+    Default: 'MLMonitoring/DriftMonitoring'
     Description: 'CloudWatch namespace for drift metrics.'
 
   DashboardName:
     Type: String
-    Default: 'FraudDetection-DriftMonitoring'
+    Default: 'MLMonitoring-DriftMonitoring'
     Description: 'CloudWatch dashboard name.'
 
 Conditions:
@@ -106,7 +106,7 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Ref SnsTopicName
-      DisplayName: 'Fraud Detection Drift Alerts'
+      DisplayName: !Sub '${ProjectName} Drift Alerts'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -351,7 +351,7 @@ Resources:
   DataDriftPsiAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-DataDrift-PSI'
+      AlarmName: !Sub '${ProjectName}-DataDrift-PSI'
       AlarmDescription: !Sub 'Data drift: average PSI exceeds ${DataDriftThreshold} (distribution shift).'
       Namespace: !Ref MetricNamespace
       MetricName: 'DataDriftPSI'
@@ -370,7 +370,7 @@ Resources:
   ModelDriftRocAucAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-ROCAUCDEGRADATION'
+      AlarmName: !Sub '${ProjectName}-ModelDrift-ROCAUCDEGRADATION'
       AlarmDescription: !Sub 'Model drift: ROC-AUC degradation exceeds ${ModelDriftThreshold}.'
       Namespace: !Ref MetricNamespace
       MetricName: 'ROCAUCDegradation'
@@ -389,7 +389,7 @@ Resources:
   ModelDriftAccuracyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-ACCURACY'
+      AlarmName: !Sub '${ProjectName}-ModelDrift-ACCURACY'
       AlarmDescription: !Sub 'Model drift: accuracy degradation exceeds ${ModelDriftThreshold}.'
       Namespace: !Ref MetricNamespace
       MetricName: 'Accuracy'
@@ -408,7 +408,7 @@ Resources:
   ModelDriftPrecisionAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-PRECISION'
+      AlarmName: !Sub '${ProjectName}-ModelDrift-PRECISION'
       AlarmDescription: !Sub 'Model drift: precision degradation exceeds ${ModelDriftThreshold}.'
       Namespace: !Ref MetricNamespace
       MetricName: 'Precision'
@@ -427,7 +427,7 @@ Resources:
   ModelDriftRecallAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-RECALL'
+      AlarmName: !Sub '${ProjectName}-ModelDrift-RECALL'
       AlarmDescription: !Sub 'Model drift: recall degradation exceeds ${ModelDriftThreshold}.'
       Namespace: !Ref MetricNamespace
       MetricName: 'Recall'
@@ -458,7 +458,7 @@ Resources:
               "type": "text",
               "x": 0, "y": 0, "width": 24, "height": 2,
               "properties": {
-                "markdown": "# Fraud Detection - Drift Monitoring Dashboard\n**Endpoint:** `${EndpointName}` | **Data-drift PSI alarm:** ${DataDriftThreshold} | **Model-drift alarm:** ${ModelDriftThreshold}"
+                "markdown": "# ${ProjectName} - Drift Monitoring Dashboard\n**Endpoint:** `${EndpointName}` | **Data-drift PSI alarm:** ${DataDriftThreshold} | **Model-drift alarm:** ${ModelDriftThreshold}"
               }
             },
             {
@@ -510,11 +510,11 @@ Resources:
               "properties": {
                 "title": "Drift Alarms Status",
                 "alarms": [
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-DataDrift-PSI",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ROCAUCDEGRADATION",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ACCURACY",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-PRECISION",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-RECALL"
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-DataDrift-PSI",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-ModelDrift-ROCAUCDEGRADATION",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-ModelDrift-ACCURACY",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-ModelDrift-PRECISION",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-ModelDrift-RECALL"
                 ]
               }
             }
