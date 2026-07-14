@@ -61,7 +61,7 @@ mlflow:
 # Athena data lake settings
 # ---------------------------------------------------------------------------
 athena:
-  database: ml_monitoring
+  database: fraud_detection
   workgroup: primary
   output_s3: ""                  # S3 path for Athena query results (derived from data bucket if empty)
   query_timeout: 300             # Seconds
