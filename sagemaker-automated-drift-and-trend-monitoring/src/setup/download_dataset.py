@@ -90,11 +90,46 @@ _RENAME_COLUMNS = {
     "emp.var.rate": "emp_var_rate",
     "cons.price.idx": "cons_price_idx",
     "cons.conf.idx": "cons_conf_idx",
+    "nr.employed": "nr_employed",
 }
 
 # Canonical column order for the output CSV, driven by dataset_schema.yaml
 # via src.config.schema.
 CSV_COLUMN_ORDER = schema.csv_column_order()
+
+
+def _read_bank_additional_full(zip_bytes: bytes) -> pd.DataFrame:
+    """Extract and parse bank-additional-full.csv from the UCI download.
+
+    The UCI `bank+marketing.zip` is a *nested* archive: its top-level
+    entries are inner zips (`bank.zip`, `bank-additional.zip`), not the
+    CSVs. `bank-additional-full.csv` lives inside `bank-additional.zip`.
+    Search the outer zip first (in case the layout changes), then descend
+    into the inner zip.
+    """
+    _target = "bank-additional-full.csv"
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as outer:
+        # Try the top level first.
+        for name in outer.namelist():
+            if name.endswith(_target):
+                with outer.open(name) as csv_file:
+                    return pd.read_csv(csv_file, sep=";")
+
+        # Descend into the inner bank-additional.zip.
+        inner_names = [n for n in outer.namelist() if n.endswith("bank-additional.zip")]
+        for inner_name in inner_names:
+            inner_bytes = outer.read(inner_name)
+            with zipfile.ZipFile(io.BytesIO(inner_bytes)) as inner:
+                for name in inner.namelist():
+                    if name.endswith(_target):
+                        with inner.open(name) as csv_file:
+                            return pd.read_csv(csv_file, sep=";")
+
+        raise FileNotFoundError(
+            f"{_target} not found in the downloaded zip. "
+            f"Outer archive contents: {outer.namelist()}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -109,20 +144,7 @@ def download_and_transform() -> Path:
     zip_bytes = response.read()
 
     logger.info("Extracting bank-additional-full.csv from zip archive…")
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        # The zip contains bank-additional/bank-additional-full.csv
-        target_name = None
-        for name in zf.namelist():
-            if name.endswith("bank-additional-full.csv"):
-                target_name = name
-                break
-        if target_name is None:
-            raise FileNotFoundError(
-                "bank-additional-full.csv not found in the downloaded zip. "
-                f"Archive contents: {zf.namelist()}"
-            )
-        with zf.open(target_name) as csv_file:
-            df = pd.read_csv(csv_file, sep=";")
+    df = _read_bank_additional_full(zip_bytes)
 
     logger.info("Transforming to project schema (%d rows)…", len(df))
     n = len(df)
