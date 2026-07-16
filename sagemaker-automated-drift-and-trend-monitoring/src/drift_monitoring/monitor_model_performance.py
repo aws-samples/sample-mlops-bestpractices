@@ -52,7 +52,9 @@ from src.config.config import (
     ATHENA_DATABASE,
     ATHENA_INFERENCE_TABLE,
     MIN_ROC_AUC_THRESHOLD,
+    PROBABILITY_COLUMN,
 )
+from src.config import schema
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,11 +165,9 @@ class ModelPerformanceMonitor:
             endpoint_name,
             model_version,
             mlflow_run_id,
-            transaction_id,
-            transaction_amount,
+            {schema.identifier_column()},
             prediction,
-            probability_fraud,
-            probability_non_fraud,
+            {PROBABILITY_COLUMN},
             confidence_score,
             ground_truth,
             ground_truth_timestamp,
@@ -218,7 +218,7 @@ class ModelPerformanceMonitor:
         # Extract predictions and ground truth
         y_true = df['ground_truth'].values
         y_pred = df['prediction'].values
-        y_proba = df['probability_fraud'].values
+        y_proba = df[PROBABILITY_COLUMN].values
 
         # Basic metrics
         metrics = {

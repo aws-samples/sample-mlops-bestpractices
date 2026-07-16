@@ -270,8 +270,17 @@ echo ""
 echo "[5/7] Deploying Lambda function..."
 
 # Get MLflow tracking URI if available
-MLFLOW_URI=$(aws sagemaker list-mlflow-tracking-servers --region $REGION --query 'TrackingServerSummaries[0].TrackingServerArn' --output text 2>/dev/null || echo "")
-SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name fraud-monitoring-results --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
+# Priority: MLFLOW_TRACKING_URI env var (from .env) > SageMaker MLflow app lookup > empty
+MLFLOW_URI="${MLFLOW_TRACKING_URI:-}"
+if [ -z "$MLFLOW_URI" ]; then
+    # Try the SageMaker MLflow tracking server API
+    MLFLOW_URI=$(aws sagemaker list-mlflow-tracking-servers --region $REGION --query 'TrackingServerSummaries[0].TrackingServerArn' --output text 2>/dev/null || echo "")
+    [ "$MLFLOW_URI" = "None" ] && MLFLOW_URI=""
+fi
+
+# Monitoring SQS queue — derive name from config (matches CFN drift-monitoring-infra.yaml)
+MONITORING_QUEUE_NAME="$(get_config MONITORING_SQS_QUEUE_NAME 2>/dev/null || echo 'fraud-detection-monitoring-results')"
+SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name "$MONITORING_QUEUE_NAME" --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
 
 # Endpoint name from config.py (single source). lambda_drift_monitor.py
 # uses this for the row it writes to monitoring_responses.

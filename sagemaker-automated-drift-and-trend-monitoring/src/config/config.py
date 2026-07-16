@@ -221,7 +221,7 @@ ATHENA_MONITORING_RESPONSES_TABLE: str = _get(
 # Used as a name prefix for CFN, IAM roles, S3 buckets, etc. Single source
 # of truth — every shell script + CFN reads this via _get / config_shell.py.
 PROJECT_NAME: str = _get(
-    "project", "name", "PROJECT_NAME", "ml-monitoring"
+    "project", "name", "PROJECT_NAME", "fraud-detection-monitoring"
 )
 
 # ===================================================================
@@ -258,7 +258,7 @@ def _derive_data_bucket() -> str:
 
 
 DATA_S3_BUCKET: str = _derive_data_bucket()
-DATA_S3_PREFIX: str = _get("s3", "prefix", "DATA_S3_PREFIX", "ml-monitoring/")
+DATA_S3_PREFIX: str = _get("s3", "prefix", "DATA_S3_PREFIX", "fraud-detection/")
 
 # Derive the Athena query-results location from the data bucket when not set
 # explicitly (account-agnostic, matches the CFN lifecycle/Lambda convention
@@ -308,7 +308,7 @@ S3_BATCH_TRANSFORM_OUTPUT: str = _s3_path(
 SQS_QUEUE_URL: str = _get("sqs", "inference_queue_url", "SQS_QUEUE_URL", "")
 MONITORING_SQS_QUEUE_NAME: str = _get(
     "sqs", "monitoring_queue_name", "MONITORING_SQS_QUEUE_NAME",
-    "ml-monitoring-results",
+    "fraud-detection-monitoring-results",
 )
 # 🔁 SYNC: lambda_drift_monitor.py:55 — Lambda fallback: '' (empty string).
 # When empty, the Lambda computes drift results but skips SQS dispatch, so
@@ -456,27 +456,27 @@ DRIFT_MONITOR_SCHEDULE: str = _drift_mon_cfg.get(
 # at the final write site). deploy_lambda_container.sh resolves this constant
 # and sets the env var so both reads land on the same name.
 ENDPOINT_NAME: str = _get(
-    "endpoint", "name", "ENDPOINT_NAME", "ml-model-endpoint"
+    "endpoint", "name", "ENDPOINT_NAME", "fraud-detector-endpoint"
 )
 DRIFT_LAMBDA_NAME: str = _get(
     "drift_monitor", "lambda_name", "DRIFT_LAMBDA_NAME",
-    "ml-monitoring-drift-monitor",
+    "fraud-detection-drift-monitor",
 )
 MONITORING_WRITER_LAMBDA_NAME: str = _get(
     "monitoring_writer", "lambda_name", "MONITORING_WRITER_LAMBDA_NAME",
-    "ml-monitoring-results-writer",
+    "fraud-detection-monitoring-results-writer",
 )
 EVENTBRIDGE_RULE_NAME: str = _get(
     "drift_monitor", "eventbridge_rule_name", "EVENTBRIDGE_RULE_NAME",
-    "ml-monitoring-drift-check",
+    "fraud-detection-drift-check",
 )
 SNS_TOPIC_NAME: str = _get(
     "drift_monitor", "sns_topic_name", "SNS_TOPIC_NAME",
-    "ml-monitoring-drift-alerts",
+    "fraud-detection-monitoring-drift-alerts",
 )
 CLOUDWATCH_DASHBOARD_NAME: str = _get(
     "drift_monitor", "cloudwatch_dashboard_name", "CLOUDWATCH_DASHBOARD_NAME",
-    "MLMonitoring-DriftMonitoring",
+    "FraudDetection-DriftMonitoring",
 )
 ECR_REPO_NAME: str = _get(
     "drift_monitor", "ecr_repo_name", "ECR_REPO_NAME",
@@ -562,25 +562,25 @@ DRIFT_GEN_RANDOM_STATE: int = int(_drift_gen_cfg.get("random_state", "123"))
 # ===================================================================
 # These IDs and display names are constants of the deployed dashboard, not
 # tunables — they live here as plain literals (no YAML mirror).
-QUICKSIGHT_DATASOURCE_ID: str = "ml-governance-athena-datasource"
-QUICKSIGHT_DATASOURCE_NAME: str = "ML Governance - Athena"
-QUICKSIGHT_INFERENCE_DATASET_ID: str = "ml-governance-inference-dataset"
-QUICKSIGHT_INFERENCE_DATASET_NAME: str = "ML Governance - Inference Monitoring"
-QUICKSIGHT_DRIFT_DATASET_ID: str = "ml-governance-drift-dataset"
-QUICKSIGHT_DRIFT_DATASET_NAME: str = "ML Governance - Drift Monitoring"
-QUICKSIGHT_FEATURE_DRIFT_DATASET_ID: str = "ml-governance-feature-drift-dataset"
-QUICKSIGHT_FEATURE_DRIFT_DATASET_NAME: str = "ML Governance - Feature Drift Analysis"
+QUICKSIGHT_DATASOURCE_ID: str = "fraud-governance-athena-datasource"
+QUICKSIGHT_DATASOURCE_NAME: str = "Fraud Governance - Athena"
+QUICKSIGHT_INFERENCE_DATASET_ID: str = "fraud-governance-inference-dataset"
+QUICKSIGHT_INFERENCE_DATASET_NAME: str = "Fraud Governance - Inference Monitoring"
+QUICKSIGHT_DRIFT_DATASET_ID: str = "fraud-governance-drift-dataset"
+QUICKSIGHT_DRIFT_DATASET_NAME: str = "Fraud Governance - Drift Monitoring"
+QUICKSIGHT_FEATURE_DRIFT_DATASET_ID: str = "fraud-governance-feature-drift-dataset"
+QUICKSIGHT_FEATURE_DRIFT_DATASET_NAME: str = "Fraud Governance - Feature Drift Analysis"
 # Feature-level (per-feature) drift dataset, backed by the Athena view
 # `feature_drift_detail` (created at dashboard-build time — see
 # create_governance_dashboard.create_feature_drift_detail_view()).
-QUICKSIGHT_FEATURE_LEVEL_DATASET_ID: str = "ml-governance-feature-level-dataset"
-QUICKSIGHT_FEATURE_LEVEL_DATASET_NAME: str = "ML Governance - Feature Level Drift"
+QUICKSIGHT_FEATURE_LEVEL_DATASET_ID: str = "fraud-governance-feature-level-dataset"
+QUICKSIGHT_FEATURE_LEVEL_DATASET_NAME: str = "Fraud Governance - Feature Level Drift"
 # Prediction-accuracy timeline dataset (CustomSql join of inference_responses
 # + ground_truth_updates).
-QUICKSIGHT_ACCURACY_DATASET_ID: str = "ml-governance-inference-dataset-accuracy"
+QUICKSIGHT_ACCURACY_DATASET_ID: str = "fraud-governance-inference-dataset-accuracy"
 QUICKSIGHT_ACCURACY_DATASET_NAME: str = "Prediction Accuracy Timeline"
-QUICKSIGHT_ANALYSIS_ID: str = "ml-governance-analysis"
-QUICKSIGHT_ANALYSIS_NAME: str = "ML Governance Analysis"
-QUICKSIGHT_DASHBOARD_ID: str = "ml-governance-dashboard"
-QUICKSIGHT_DASHBOARD_NAME: str = "ML Governance"
+QUICKSIGHT_ANALYSIS_ID: str = "fraud-governance-analysis"
+QUICKSIGHT_ANALYSIS_NAME: str = "Fraud Detection Governance"
+QUICKSIGHT_DASHBOARD_ID: str = "fraud-governance-dashboard"
+QUICKSIGHT_DASHBOARD_NAME: str = "Fraud Detection Governance"
 QUICKSIGHT_SERVICE_ROLE_NAME: str = "aws-quicksight-service-role-v0"

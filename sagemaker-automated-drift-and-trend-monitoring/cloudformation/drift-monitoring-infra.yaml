@@ -19,7 +19,7 @@ Description: >
 Parameters:
   ProjectName:
     Type: String
-    Default: 'ml-monitoring'
+    Default: 'fraud-detection-monitoring'
     Description: 'Prefix for resource names/tags (lowercase letters, numbers, hyphens).'
     AllowedPattern: '^[a-z0-9-]+$'
 
@@ -31,7 +31,7 @@ Parameters:
 
   AthenaDatabase:
     Type: String
-    Default: 'ml_monitoring'
+    Default: 'fraud_detection'
     Description: 'Glue/Athena database that holds the Iceberg tables.'
 
   MonitoringTableName:
@@ -41,7 +41,7 @@ Parameters:
 
   EndpointName:
     Type: String
-    Default: 'ml-model-endpoint'
+    Default: 'fraud-detector-endpoint'
     Description: 'SageMaker endpoint being monitored (CloudWatch metric dimension).'
 
   AlertEmail:
@@ -64,22 +64,22 @@ Parameters:
 
   MonitoringQueueName:
     Type: String
-    Default: 'ml-monitoring-results'
+    Default: 'fraud-detection-monitoring-results'
     Description: 'SQS queue the drift-monitor Lambda writes results to.'
 
   MonitoringWriterLambdaName:
     Type: String
-    Default: 'ml-monitoring-results-writer'
+    Default: 'fraud-detection-monitoring-results-writer'
     Description: 'Name of the SQS->Athena monitoring-results writer Lambda.'
 
   SnsTopicName:
     Type: String
-    Default: 'ml-monitoring-drift-alerts'
+    Default: 'fraud-detection-monitoring-drift-alerts'
     Description: 'SNS topic name for drift alerts.'
 
   DriftMonitorRoleName:
     Type: String
-    Default: 'ml-monitoring-drift-monitor-role'
+    Default: 'fraud-detection-drift-monitor-role'
     Description: >-
       IAM role name assumed by the scheduled (container) drift-monitor Lambda.
       scripts/deploy_lambda_container.sh reuses this exact role when it creates
@@ -87,12 +87,12 @@ Parameters:
 
   MetricNamespace:
     Type: String
-    Default: 'MLMonitoring/DriftMonitoring'
+    Default: 'FraudDetection/DriftMonitoring'
     Description: 'CloudWatch namespace for drift metrics.'
 
   DashboardName:
     Type: String
-    Default: 'MLMonitoring-DriftMonitoring'
+    Default: 'FraudDetection-DriftMonitoring'
     Description: 'CloudWatch dashboard name.'
 
 Conditions:
@@ -223,7 +223,7 @@ Resources:
               columns = [
                   'monitoring_run_id', 'monitoring_timestamp',
                   'endpoint_name', 'model_version', 'model_package_arn',
-                  'evaluation_snapshot_id',
+                  'evaluation_snapshot_id', 'training_snapshot_id',
                   'data_drift_detected', 'drifted_columns_count', 'drifted_columns_share',
                   'features_analyzed', 'data_sample_size', 'model_drift_detected',
                   'baseline_roc_auc', 'current_roc_auc',

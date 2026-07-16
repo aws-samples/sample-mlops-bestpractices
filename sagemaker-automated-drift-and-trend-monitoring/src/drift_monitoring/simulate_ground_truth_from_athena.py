@@ -53,7 +53,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Schema-driven column name for ground truth
+# Schema-driven column name for ground truth.
+# Derived from dataset_schema.yaml: actual_{target_column}
+# e.g. "actual_subscribed" for Bank Marketing, "actual_fraud" for fraud detection.
 ACTUAL_TARGET_COL = f'actual_{schema.target_column()}'
 
 
@@ -111,10 +113,11 @@ class GroundTruthSimulator:
         """Load inference predictions that don't have ground truth yet."""
         logger.info("Loading predictions without ground truth from Athena...")
 
+        id_col = schema.identifier_column()
         query = f"""
         SELECT
             inference_id,
-            transaction_id,
+            {id_col},
             CAST(request_timestamp AS TIMESTAMP(3)) as request_timestamp,
             endpoint_name,
             prediction,
@@ -280,8 +283,9 @@ class GroundTruthSimulator:
         df = self.assign_confirmation_sources(df)
 
         # Create updates dataframe with Athena schema
+        id_col = schema.identifier_column()
         updates = pd.DataFrame({
-            'transaction_id': df['transaction_id'],
+            id_col: df[id_col],
             'inference_id': df['inference_id'],
             ACTUAL_TARGET_COL: df[ACTUAL_TARGET_COL],
             'confirmation_timestamp': df['confirmation_timestamp'],

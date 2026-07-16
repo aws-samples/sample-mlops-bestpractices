@@ -42,7 +42,12 @@ from src.config.config import (
     ATHENA_DATABASE,
     ATHENA_INFERENCE_TABLE,
     ATHENA_GROUND_TRUTH_UPDATES_TABLE,
+    PROBABILITY_COLUMN,
 )
+from src.config import schema
+
+# Schema-driven column name for ground truth in ground_truth_updates table.
+ACTUAL_TARGET_COL = f'actual_{schema.target_column()}'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,22 +133,22 @@ class GroundTruthUpdater:
         query = f"""
         SELECT
             ir.inference_id,
-            ir.transaction_id,
+            ir.{schema.identifier_column()},
             ir.request_timestamp as prediction_timestamp,
             ir.prediction as current_prediction,
-            ir.probability_fraud as predicted_probability,
+            ir.{PROBABILITY_COLUMN} as predicted_probability,
             ir.ground_truth as current_ground_truth,
-            gtu.actual_fraud as new_ground_truth,
+            gtu.{ACTUAL_TARGET_COL} as new_ground_truth,
             gtu.confirmation_timestamp,
             gtu.confirmation_source,
             gtu.days_since_prediction,
             CASE
-                WHEN ir.prediction = CAST(gtu.actual_fraud AS INT) THEN 'correct'
+                WHEN ir.prediction = CAST(gtu.{ACTUAL_TARGET_COL} AS INT) THEN 'correct'
                 ELSE 'incorrect'
             END as prediction_correctness,
             CASE
-                WHEN ir.prediction = 1 AND gtu.actual_fraud = false THEN 'false_positive'
-                WHEN ir.prediction = 0 AND gtu.actual_fraud = true THEN 'false_negative'
+                WHEN ir.prediction = 1 AND gtu.{ACTUAL_TARGET_COL} = false THEN 'false_positive'
+                WHEN ir.prediction = 0 AND gtu.{ACTUAL_TARGET_COL} = true THEN 'false_negative'
                 ELSE 'correct'
             END as error_type
         FROM {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE} ir
@@ -187,10 +192,10 @@ class GroundTruthUpdater:
         query = f"""
         SELECT
             COUNT(*) as total_updates,
-            COALESCE(SUM(CAST(gtu.actual_fraud AS INT)), 0) as fraud_cases,
-            COALESCE(SUM(CASE WHEN ir.prediction = CAST(gtu.actual_fraud AS INT) THEN 1 ELSE 0 END), 0) as correct_predictions,
-            COALESCE(SUM(CASE WHEN ir.prediction = 1 AND gtu.actual_fraud = false THEN 1 ELSE 0 END), 0) as false_positives,
-            COALESCE(SUM(CASE WHEN ir.prediction = 0 AND gtu.actual_fraud = true THEN 1 ELSE 0 END), 0) as false_negatives,
+            COALESCE(SUM(CAST(gtu.{ACTUAL_TARGET_COL} AS INT)), 0) as fraud_cases,
+            COALESCE(SUM(CASE WHEN ir.prediction = CAST(gtu.{ACTUAL_TARGET_COL} AS INT) THEN 1 ELSE 0 END), 0) as correct_predictions,
+            COALESCE(SUM(CASE WHEN ir.prediction = 1 AND gtu.{ACTUAL_TARGET_COL} = false THEN 1 ELSE 0 END), 0) as false_positives,
+            COALESCE(SUM(CASE WHEN ir.prediction = 0 AND gtu.{ACTUAL_TARGET_COL} = true THEN 1 ELSE 0 END), 0) as false_negatives,
             AVG(gtu.days_since_prediction) as avg_days_to_confirmation,
             CAST(MIN(gtu.confirmation_timestamp) AS TIMESTAMP(3)) as earliest_confirmation,
             CAST(MAX(gtu.confirmation_timestamp) AS TIMESTAMP(3)) as latest_confirmation
@@ -289,7 +294,7 @@ class GroundTruthUpdater:
             FROM (
                 SELECT
                     ir.inference_id,
-                    CAST(gtu.actual_fraud AS INT) as ground_truth,
+                    CAST(gtu.{ACTUAL_TARGET_COL} AS INT) as ground_truth,
                     gtu.confirmation_timestamp as ground_truth_timestamp,
                     gtu.confirmation_source as ground_truth_source,
                     gtu.days_since_prediction as days_to_ground_truth,
@@ -332,7 +337,7 @@ class GroundTruthUpdater:
             update_query = f"""
             UPDATE {ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}
             SET ground_truth = (
-                    SELECT CAST(gtu.actual_fraud AS INT)
+                    SELECT CAST(gtu.{ACTUAL_TARGET_COL} AS INT)
                     FROM {ATHENA_DATABASE}.{ATHENA_GROUND_TRUTH_UPDATES_TABLE} gtu
                     WHERE gtu.inference_id = {ATHENA_INFERENCE_TABLE}.inference_id
                     ORDER BY gtu.confirmation_timestamp DESC

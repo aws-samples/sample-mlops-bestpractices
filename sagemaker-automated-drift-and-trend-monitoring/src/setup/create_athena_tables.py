@@ -106,6 +106,9 @@ def _table_ddls() -> Dict[str, str]:
     )
     aux_ddl_fragment = f"{aux_ddl}, " if aux_ddl else ""
 
+    # Config-driven probability column names for inference_responses / ground_truth.
+    from src.config.config import PROBABILITY_COLUMN, PROBABILITY_ALT_COLUMN
+
     ddls: Dict[str, str] = {}
 
     ddls["training_data"] = f"""
@@ -134,7 +137,7 @@ TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
 CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.ground_truth (
     {id_col} STRING, prediction_timestamp TIMESTAMP, window_id INT,
     {feature_ddl},
-    ground_truth_fraud BOOLEAN, observed_fraud BOOLEAN, fraud_probability DOUBLE,
+    ground_truth_{target_col} BOOLEAN, observed_{target_col} BOOLEAN, {PROBABILITY_COLUMN} DOUBLE,
     data_source STRING, ingestion_timestamp TIMESTAMP, batch_id STRING
 )
 PARTITIONED BY (day(prediction_timestamp))
@@ -147,10 +150,10 @@ CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.inference_responses (
     inference_id STRING, request_timestamp TIMESTAMP, endpoint_name STRING,
     model_version STRING, mlflow_run_id STRING,
     input_features STRING,
-    prediction INT, probability_fraud DOUBLE, probability_non_fraud DOUBLE, confidence_score DOUBLE,
+    prediction INT, {PROBABILITY_COLUMN} DOUBLE, {PROBABILITY_ALT_COLUMN} DOUBLE, confidence_score DOUBLE,
     ground_truth INT, ground_truth_timestamp TIMESTAMP, ground_truth_source STRING, days_to_ground_truth DOUBLE,
     inference_latency_ms DOUBLE, model_load_time_ms DOUBLE, preprocessing_time_ms DOUBLE,
-    {id_col} STRING, transaction_amount DOUBLE, customer_id STRING,
+    {id_col} STRING,
     is_high_confidence BOOLEAN, is_low_confidence BOOLEAN, prediction_bucket STRING,
     request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING,
     monitoring_run_id STRING
@@ -171,10 +174,13 @@ LOCATION 's3://{bucket}/{prefix}/drifted_data/'
 TBLPROPERTIES ('parquet.compression'='SNAPPY')
 """
 
+    # Schema-driven ground truth column: actual_{target_column}
+    actual_target_col = f"actual_{target_col}"
+
     ddls["ground_truth_updates"] = f"""
 CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.ground_truth_updates (
     {id_col} STRING, inference_id STRING,
-    actual_fraud BOOLEAN, confirmation_timestamp TIMESTAMP, confirmation_source STRING,
+    {actual_target_col} BOOLEAN, confirmation_timestamp TIMESTAMP, confirmation_source STRING,
     transaction_timestamp TIMESTAMP, prediction_timestamp TIMESTAMP,
     days_since_transaction DOUBLE, days_since_prediction DOUBLE,
     investigation_notes STRING, investigation_priority STRING,

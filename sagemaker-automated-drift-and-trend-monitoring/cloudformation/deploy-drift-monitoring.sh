@@ -94,6 +94,22 @@ if [ -z "${REGION:-}" ]; then
   fi
 fi
 
+# --- Resolve defaults from .env when not explicitly provided ---
+# Only fill in values that weren't passed via CLI (still at their defaults).
+ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+if [ -f "$ENV_FILE" ]; then
+  # Read .env into a subshell to avoid clobbering local variables.
+  _env_data_bucket="$(grep -E '^DATA_S3_BUCKET=' "$ENV_FILE" | cut -d= -f2- || true)"
+  _env_endpoint="$(grep -E '^ENDPOINT_NAME=' "$ENV_FILE" | cut -d= -f2- || true)"
+  _env_athena_db="$(grep -E '^ATHENA_DATABASE=' "$ENV_FILE" | cut -d= -f2- || true)"
+  _env_alert_email="$(grep -E '^ALERT_EMAIL=' "$ENV_FILE" | cut -d= -f2- || true)"
+
+  [ -z "$DATA_BUCKET" ] && DATA_BUCKET="${_env_data_bucket:-}"
+  [ "$ENDPOINT_NAME" = "fraud-detector-endpoint" ] && [ -n "${_env_endpoint:-}" ] && ENDPOINT_NAME="$_env_endpoint"
+  [ "$ATHENA_DATABASE" = "fraud_detection" ] && [ -n "${_env_athena_db:-}" ] && ATHENA_DATABASE="$_env_athena_db"
+  [ -z "$ALERT_EMAIL" ] && ALERT_EMAIL="${_env_alert_email:-}"
+fi
+
 # --- Validation ---
 if [ -z "$DATA_BUCKET" ]; then
   echo "ERROR: --data-bucket is required"

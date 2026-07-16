@@ -28,6 +28,7 @@ from src.config.config import (
     ATHENA_WORKGROUP,
     ATHENA_OUTPUT_S3,
     ATHENA_QUERY_TIMEOUT,
+    PROBABILITY_COLUMN,
 )
 
 logger = logging.getLogger(__name__)
@@ -690,7 +691,7 @@ class AthenaClient:
                     model_version,
                     COUNT(*) as total_predictions,
                     SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as fraud_count,
-                    AVG(probability_fraud) as avg_fraud_probability,
+                    AVG({PROBABILITY_COLUMN}) as avg_fraud_probability,
                     AVG(inference_latency_ms) as avg_latency_ms,
                     STDDEV(inference_latency_ms) as stddev_latency_ms,
                     MIN(inference_latency_ms) as min_latency_ms,

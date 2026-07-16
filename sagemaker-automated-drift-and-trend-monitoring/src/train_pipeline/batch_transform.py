@@ -52,6 +52,8 @@ from src.config.config import (
     MLFLOW_TRACKING_URI,
     ATHENA_GROUND_TRUTH_TABLE,
     ATHENA_DATABASE,
+    PROBABILITY_COLUMN,
+    PROBABILITY_ALT_COLUMN,
 )
 from src.train_pipeline.athena.athena_client import AthenaClient
 from src.utils.mlflow_utils import setup_mlflow_tracking, get_or_create_experiment
@@ -102,8 +104,7 @@ def export_athena_to_s3(
         columns_to_drop = ['is_fraud', 'fraud_prediction', 'fraud_probability',
                           'ground_truth', 'ground_truth_fraud', 'observed_fraud',
                           'data_version', 'created_at', 'updated_at',
-                          'ingestion_timestamp', 'batch_id', 'data_source',
-                          'transaction_id', 'customer_id']  # Also drop IDs
+                          'ingestion_timestamp', 'batch_id', 'data_source']
 
         # Drop columns that exist
         df = df.drop(*[col for col in columns_to_drop if col in df.columns])
@@ -283,10 +284,10 @@ def process_batch_results(
             lambda x: x[0] if isinstance(x, list) else x
         )
     if 'probabilities' in predictions_df.columns:
-        input_df['probability_fraud'] = predictions_df['probabilities'].apply(
+        input_df[PROBABILITY_COLUMN] = predictions_df['probabilities'].apply(
             lambda x: x.get('fraud', [0])[0] if isinstance(x, dict) else 0
         )
-        input_df['probability_non_fraud'] = predictions_df['probabilities'].apply(
+        input_df[PROBABILITY_ALT_COLUMN] = predictions_df['probabilities'].apply(
             lambda x: x.get('non_fraud', [0])[0] if isinstance(x, dict) else 0
         )
 
@@ -324,13 +325,13 @@ def write_results_to_athena(
     results_df['inference_mode'] = 'batch'
 
     # Calculate confidence scores
-    results_df['confidence_score'] = results_df[['probability_fraud', 'probability_non_fraud']].max(axis=1)
+    results_df['confidence_score'] = results_df[[PROBABILITY_COLUMN, PROBABILITY_ALT_COLUMN]].max(axis=1)
     results_df['is_high_confidence'] = results_df['confidence_score'] > 0.9
     results_df['is_low_confidence'] = (results_df['confidence_score'] >= 0.4) & (results_df['confidence_score'] <= 0.6)
 
     # Convert input features to JSON
     feature_cols = [col for col in results_df.columns
-                   if col not in ['prediction', 'probability_fraud', 'probability_non_fraud',
+                   if col not in ['prediction', PROBABILITY_COLUMN, PROBABILITY_ALT_COLUMN,
                                  'inference_id', 'request_timestamp', 'endpoint_name',
                                  'model_version', 'mlflow_run_id', 'inference_mode',
                                  'confidence_score', 'is_high_confidence', 'is_low_confidence']]
@@ -342,8 +343,8 @@ def write_results_to_athena(
     # Select columns for Athena
     athena_cols = [
         'inference_id', 'request_timestamp', 'endpoint_name', 'model_version',
-        'mlflow_run_id', 'input_features', 'prediction', 'probability_fraud',
-        'probability_non_fraud', 'confidence_score', 'is_high_confidence',
+        'mlflow_run_id', 'input_features', 'prediction', PROBABILITY_COLUMN,
+        PROBABILITY_ALT_COLUMN, 'confidence_score', 'is_high_confidence',
         'is_low_confidence', 'inference_mode'
     ]
 
@@ -524,7 +525,7 @@ def batch_transform(
         # Calculate metrics
         total_predictions = len(results_df)
         fraud_predictions = (results_df['prediction'] == 1).sum()
-        avg_fraud_prob = results_df['probability_fraud'].mean()
+        avg_fraud_prob = results_df[PROBABILITY_COLUMN].mean()
 
         mlflow.log_metric("total_predictions", total_predictions)
         mlflow.log_metric("fraud_predictions", fraud_predictions)

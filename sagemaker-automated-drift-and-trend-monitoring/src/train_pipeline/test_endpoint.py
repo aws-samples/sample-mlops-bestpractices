@@ -34,6 +34,7 @@ from src.config.config import (
     CSV_TRAINING_DATA,
     ATHENA_TRAINING_TABLE,
     ATHENA_DATABASE,
+    PROBABILITY_COLUMN,
 )
 from src.train_pipeline.athena.athena_client import AthenaClient
 
@@ -175,7 +176,7 @@ def query_athena_metrics(
         query = f"""
         SELECT
             COUNT(*) as total_predictions,
-            AVG(probability_fraud) as avg_fraud_prob,
+            AVG({PROBABILITY_COLUMN}) as avg_fraud_prob,
             SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as fraud_count,
             SUM(CASE WHEN prediction = 0 THEN 1 ELSE 0 END) as non_fraud_count,
             AVG(inference_latency_ms) as avg_latency_ms,

@@ -27,6 +27,13 @@ HIGH_CONFIDENCE_THRESHOLD = float(os.getenv('HIGH_CONFIDENCE_THRESHOLD', '0.9'))
 LOW_CONFIDENCE_LOWER = float(os.getenv('LOW_CONFIDENCE_LOWER', '0.4'))
 LOW_CONFIDENCE_UPPER = float(os.getenv('LOW_CONFIDENCE_UPPER', '0.6'))
 
+# Schema-driven column names (set at deploy time by deploy_endpoint.py).
+# Defaults match config.yaml so the handler works even if the env vars are
+# not explicitly set.
+PROBABILITY_COLUMN = os.getenv('PROBABILITY_COLUMN', 'probability_positive')
+PROBABILITY_ALT_COLUMN = os.getenv('PROBABILITY_ALT_COLUMN', 'probability_negative')
+IDENTIFIER_COLUMN = os.getenv('IDENTIFIER_COLUMN', 'client_id')
+
 sqs_client = None
 
 
@@ -201,17 +208,15 @@ def predict_fn(input_data: pd.DataFrame, model_dict: Dict[str, Any]) -> Dict[str
                     'mlflow_run_id': MLFLOW_RUN_ID,
                     'input_features': json.dumps(input_data.iloc[idx].to_dict()),
                     'prediction': int(predictions[idx]),
-                    'probability_fraud': fraud_prob,
-                    'probability_non_fraud': float(1 - fraud_prob),
+                    PROBABILITY_COLUMN: fraud_prob,
+                    PROBABILITY_ALT_COLUMN: float(1 - fraud_prob),
                     'confidence_score': confidence_score,
                     'ground_truth': None,
                     'ground_truth_timestamp': None,
                     'inference_latency_ms': inference_latency_ms,
                     'model_load_time_ms': model_load_time_ms,
                     'preprocessing_time_ms': preprocessing_time_ms,
-                    'transaction_id': str(original_data.iloc[idx].get('transaction_id', '')) or None,
-                    'transaction_amount': float(original_data.iloc[idx].get('transaction_amount', 0)) if 'transaction_amount' in original_data.columns else None,
-                    'customer_id': str(original_data.iloc[idx].get('customer_id', '')) or None,
+                    IDENTIFIER_COLUMN: str(original_data.iloc[idx].get(IDENTIFIER_COLUMN, '')) or None,
                     'is_high_confidence': confidence_score > HIGH_CONFIDENCE_THRESHOLD,
                     'is_low_confidence': LOW_CONFIDENCE_LOWER <= confidence_score <= LOW_CONFIDENCE_UPPER,
                     'prediction_bucket': get_prediction_bucket(fraud_prob),

@@ -13,7 +13,7 @@
 # are not set: ${project.name}-data-${AWS::AccountId}. Must match the
 # ProjectName parameter used by the CloudFormation stack.
 project:
-  name: ml-monitoring
+  name: fraud-detection-monitoring
 
 # ---------------------------------------------------------------------------
 # AWS
@@ -31,7 +31,7 @@ project:
 # env var if your account was activated elsewhere.
 aws:
   region: us-west-2
-  quicksight_identity_region: us-west-2
+  quicksight_identity_region: us-east-1
 
 # ---------------------------------------------------------------------------
 # SageMaker
@@ -84,7 +84,7 @@ athena:
 # ---------------------------------------------------------------------------
 s3:
   bucket: ""                     # Data lake bucket (derived from project.name if empty)
-  prefix: "ml-monitoring/"
+  prefix: "fraud-detection/"
   # Per-resource paths (populated automatically from bucket + prefix if left empty)
   training_data: ""              # s3://bucket/prefix/training_data/
   ground_truth: ""               # s3://bucket/prefix/ground_truth/
@@ -108,7 +108,7 @@ s3:
 #      with this name, then wires the queue → monitoring-results-writer
 #      Lambda. Triggered from notebook 3 Section 5.2.
 sqs:
-  monitoring_queue_name: ml-monitoring-results
+  monitoring_queue_name: fraud-detection-monitoring-results
   monitoring_queue_url: ""
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ data:
   #   src/setup/setup_athena_tables.py (legacy bulk-load path)
   #   src/train_pipeline/athena/data_migrator.py (one-off Athena bootstrap)
   # The normal flow (notebook 1 → data download → train) never reads these.
-  csv_training_data: "data/training_predictions_final.csv"
+  csv_training_data: "data/bank_marketing_predictions_final.csv"
   csv_ground_truth: "data/ground_truth.csv"
   csv_drifted_data: "data/drifted_data.csv"
   # S3 locations (populated automatically from bucket + prefix if left empty)
