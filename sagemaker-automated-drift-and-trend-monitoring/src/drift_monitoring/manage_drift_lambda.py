@@ -35,6 +35,7 @@ from src.config.config import (
     ATHENA_OUTPUT_S3,
     DATA_DRIFT_THRESHOLD,
     DRIFT_LAMBDA_NAME,
+    ECR_REPO_NAME,
     EVENTBRIDGE_RULE_NAME,
     LAMBDA_EXEC_ROLE,
     MODEL_DRIFT_THRESHOLD,
@@ -178,6 +179,102 @@ def bootstrap_drift_lambda_role(
         time.sleep(propagation_wait_seconds)
 
     return {'role_name': role_name, 'role_arn': role_arn}
+
+
+def repoint_drift_lambda_to_latest(
+    lambda_name: Optional[str] = None,
+    repository: Optional[str] = None,
+    region: Optional[str] = None,
+    lambda_client: Optional[Any] = None,
+    ecr_client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Point the drift-monitor Lambda at the current ``:latest`` ECR image.
+
+    A container Lambda pins whatever digest ``:latest`` resolved to at its
+    last ``update_function_code`` call and never re-resolves it on invocation.
+    So after a new image is pushed to ``:latest`` (by CI, a rebuild, or a
+    teammate) the function keeps running the OLD digest until something
+    repoints it. This resolves ``:latest`` to its immutable digest, updates
+    the function BY DIGEST (explicit + verifiable, not a race against the
+    mutable tag), waits for the update, and confirms the function landed on
+    it. Use this to pick up a freshly pushed image without a Docker rebuild.
+
+    Args:
+        lambda_name: Name of the drift-monitor Lambda. Defaults to config.DRIFT_LAMBDA_NAME.
+        repository: ECR repository name. Defaults to config.ECR_REPO_NAME.
+        region: AWS region. Defaults to config.AWS_DEFAULT_REGION.
+        lambda_client: Optional boto3 Lambda client (constructed if not provided).
+        ecr_client: Optional boto3 ECR client (constructed if not provided).
+
+    Returns:
+        Dict with keys: 'lambda_name', 'repository', 'previous_image_uri',
+        'deployed_image_uri', 'digest', 'changed' (bool — whether the
+        function's resolved image actually moved).
+
+    Raises:
+        RuntimeError: If ``:latest`` has no image in ECR, or the function did
+            not land on the intended digest after the update.
+    """
+    resolved_region = region or AWS_DEFAULT_REGION
+    resolved_lambda_name = lambda_name or DRIFT_LAMBDA_NAME
+    resolved_repository = repository or ECR_REPO_NAME
+
+    if lambda_client is None:
+        lambda_client = boto3.client('lambda', region_name=resolved_region)
+    if ecr_client is None:
+        ecr_client = boto3.client('ecr', region_name=resolved_region)
+
+    # Resolve :latest -> immutable digest.
+    try:
+        images = ecr_client.describe_images(
+            repositoryName=resolved_repository,
+            imageIds=[{'imageTag': 'latest'}],
+        )['imageDetails']
+    except ClientError as e:
+        raise RuntimeError(
+            f"Could not resolve {resolved_repository}:latest in ECR "
+            f"({resolved_region}): {e}. Build/push the image first."
+        ) from e
+    if not images:
+        raise RuntimeError(
+            f"No image tagged ':latest' in ECR repo '{resolved_repository}'. "
+            "Build/push the drift-monitor image before repointing."
+        )
+    digest = images[0]['imageDigest']
+
+    account_id = boto3.client('sts', region_name=resolved_region).get_caller_identity()['Account']
+    image_uri = f"{account_id}.dkr.ecr.{resolved_region}.amazonaws.com/{resolved_repository}@{digest}"
+
+    previous = lambda_client.get_function(
+        FunctionName=resolved_lambda_name,
+    )['Code'].get('ResolvedImageUri', '')
+
+    logger.info(f"Repointing {resolved_lambda_name} to {image_uri}")
+    lambda_client.update_function_code(
+        FunctionName=resolved_lambda_name,
+        ImageUri=image_uri,
+    )
+    lambda_client.get_waiter('function_updated_v2').wait(FunctionName=resolved_lambda_name)
+
+    deployed = lambda_client.get_function(
+        FunctionName=resolved_lambda_name,
+    )['Code'].get('ResolvedImageUri', '')
+    if deployed.split('@')[-1] != digest:
+        raise RuntimeError(
+            f"{resolved_lambda_name} resolved to {deployed.split('@')[-1]} "
+            f"but expected {digest} — the function did not pick up the image."
+        )
+    logger.info(f"✓ {resolved_lambda_name} is now running {digest}")
+
+    return {
+        'lambda_name': resolved_lambda_name,
+        'repository': resolved_repository,
+        'previous_image_uri': previous,
+        'deployed_image_uri': deployed,
+        'digest': digest,
+        'changed': previous != deployed,
+    }
 
 
 def invoke_drift_lambda(

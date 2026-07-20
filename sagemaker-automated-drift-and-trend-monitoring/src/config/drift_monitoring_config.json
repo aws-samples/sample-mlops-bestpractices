@@ -1,11 +1,11 @@
 {
-  "sns_topic_arn": "arn:aws:sns:us-east-1:329430715989:fraud-detection-monitoring-drift-alerts",
-  "lambda_function_arn": "arn:aws:lambda:us-east-1:329430715989:function:fraud-detection-drift-monitor",
-  "eventbridge_rule_arn": "arn:aws:events:us-east-1:329430715989:rule/fraud-detection-drift-check",
-  "ecr_image_uri": "329430715989.dkr.ecr.us-east-1.amazonaws.com/fraud-detection-drift-monitor:latest",
+  "sns_topic_arn": "arn:aws:sns:us-west-2:<ACCOUNT_ID>:fraud-detection-drift-alerts",
+  "lambda_function_arn": "arn:aws:lambda:us-west-2:<ACCOUNT_ID>:function:fraud-detection-drift-monitor",
+  "eventbridge_rule_arn": "arn:aws:events:us-west-2:<ACCOUNT_ID>:rule/fraud-detection-drift-check",
+  "ecr_image_uri": "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/fraud-detection-drift-monitor@sha256:f6fde6bf874cbd127e2b5a57a18755354f28b93c66a38019a0747a62a86df0e6",
   "schedule": "cron(0 2 * * ? *)",
   "data_drift_threshold": "0.2",
   "model_drift_threshold": "0.05",
   "email": "nobody@example.com",
-  "region": "us-east-1"
+  "region": "us-west-2"
 }

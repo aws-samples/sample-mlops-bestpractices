@@ -252,14 +252,225 @@ Full command reference: `python main.py --help` and `python main.py <command> --
 - **Testing** — Verify endpoint responds correctly to test predictions
 
 ### Monitoring (Notebook 3)
+
+The monitoring system captures every prediction, integrates delayed ground truth, and runs automated drift analysis. All defaults are configurable via `src/config/config.yaml`.
+
+#### Real-Time Inference Capture
+
+Applications send transactions with **30 features** to the SageMaker AI endpoint. The **custom inference handler** runs the XGBoost model (solution works with any model framework) and returns the prediction immediately. In the background, the handler **asynchronously sends** the full prediction record to an Amazon SQS queue, adding **minimal latency** (~10-50ms) to the response path.
+
+**Logged fields per prediction:**
+- Input features (30 feature values as JSON)
+- Prediction (0/1 fraud classification)
+- Confidence score (probability_fraud, probability_non_fraud)
+- Model version, MLflow run ID, model package ARN
+- Endpoint name, request timestamp
+- Latency metrics (inference time, preprocessing time)
+- Transaction metadata (transaction_id, customer_id, amount)
+
+#### Buffered Batch Writes to Data Lake
+
+A **Lambda consumer** (`{ProjectName}-inference-logger`, deployed via CloudFormation) reads from the SQS queue in **configurable batches**:
+- **Batch size**: 10 messages (default)
+- **Batch window**: 30 seconds (max wait time)
+- Whichever threshold is hit first triggers a write
+
+Each batch is written to the **`inference_responses` Athena Iceberg table**, partitioned by date for efficient querying. This creates a complete, queryable audit trail of every prediction with:
+- Zero inference latency impact (async SQS)
+- 10-300x file count reduction vs. per-request logging
+- 62% faster Athena queries vs. SageMaker DataCaptureConfig
+
+#### Ground Truth Integration
+
+As fraud investigations complete (days or weeks later), confirmed labels flow into the **`ground_truth_updates`** table. Athena **MERGE statements** join confirmed labels back to the original inference records:
+
+```sql
+MERGE INTO inference_responses AS target
+USING ground_truth_updates AS source
+ON target.inference_id = source.inference_id
+WHEN MATCHED AND target.ground_truth IS NULL THEN
+  UPDATE SET 
+    target.ground_truth = source.actual_fraud,
+    target.ground_truth_timestamp = source.confirmation_timestamp,
+    target.days_to_ground_truth = date_diff('day', target.request_timestamp, source.confirmation_timestamp)
+```
+
+This tracking of **`days_since_prediction`** for each label makes accurate model performance calculation possible despite real-world label delays (1-30 days typical in fraud detection).
+
+#### Automated Daily Drift Analysis
+
+At **2 AM UTC daily** (configurable via EventBridge schedule - adjust based on volumes and monitoring granularity needed), EventBridge triggers a Lambda function (`{ProjectName}-drift-monitor`) that:
+
+1. **Queries recent inference data** from Athena
+   - Last N days configurable in `config.yaml` (deployed default: 1 day for both data/model drift)
+   - Filters: `WHERE ground_truth IS NOT NULL` for model drift (skipped if insufficient samples)
+
+2. **Loads frozen baseline distributions**
+   - Reads registered `baseline.json` from the deployed ModelPackage (via SageMaker Model Registry)
+   - **Time-travels** to exact Iceberg snapshots:
+     - `training_data FOR VERSION AS OF <training_snapshot_id>` (baseline for **data drift**)
+     - `evaluation_data FOR VERSION AS OF <evaluation_snapshot_id>` (baseline for **model drift**)
+   - No hardcoded baselines, no stale env vars - always monitors against the exact data the deployed model was trained/scored on
+
+3. **Runs Evidently AI drift detection**
+   - **DataDriftPreset**: Generates PSI (Population Stability Index) scores for every feature
+     - Uses `evidently>=0.4.22,<1` (see `pyproject.toml`)
+     - Statistical tests: Kolmogorov-Smirnov (numerical), Chi-square (categorical), Wasserstein distance
+   - **ClassificationPreset**: Generates ROC-AUC, precision, recall, F1, confusion matrix
+     - Only runs when ground truth is available
+     - Requires minimum sample size (default: 100 predictions with labels)
+
+4. **Compares against configurable thresholds**
+   - **Data drift threshold**: 0.2 (20% of features drifted = alert)
+   - **Model drift threshold**: 0.05 (5% ROC-AUC degradation = alert)
+   - Separate sensitivity levels for data vs. model drift
+   - All thresholds in `config.yaml` or Lambda environment variables
+
+5. **Writes results to multiple destinations**
+   - `monitoring_responses` Athena table (durable source of truth, read by QuickSight)
+   - MLflow artifacts (HTML Evidently reports) + metrics
+   - SNS topic (email/SMS alerts when thresholds exceeded)
+   - Backfills `monitoring_run_id` onto analyzed `inference_responses` rows for traceability
+
 - **Inference logging** — Every prediction → SQS → Lambda batches (10 msgs or 30s) → `inference_responses` Iceberg table
 - **Ground truth integration** — Simulated (dev) or fed from fraud investigation systems (prod) → `ground_truth_updates` table → MERGE into `inference_responses`
 - **Drift detection** — Evidently `DataDriftPreset` against the frozen `training_data` baseline (KS for numerics, chi-square for categoricals, PSI per feature) + `ClassificationPreset` against the frozen `evaluation_data` baseline (ROC, PR, confusion matrix). Thresholds configurable via `src/config/config.yaml`.
+  - **⚠️ Important:** In MLflow, you may initially see **only data drift metrics** (not model drift). This is expected! **Data drift** runs on any predictions immediately (compares input feature distributions), while **model drift** requires ground truth labels to measure performance degradation (ROC-AUC, precision, recall). In fraud detection, ground truth arrives 1-30 days after transactions when fraud investigations complete. Until the `ground_truth_updates` table is populated and MERGE'd into `inference_responses`, the drift Lambda skips model drift checks (prints "⚠️ Not enough samples with ground truth"). Once ground truth is available (run notebook 3 Section 6 to simulate, or wait for real fraud confirmations in production), subsequent drift runs will log both data and model drift metrics to MLflow.
+
+### Drift Detection Configuration: Three Sources
+
+Configuration values differ between notebook testing, Lambda code defaults, and actual deployed values. Understanding these differences is critical for tuning the system:
+
+| Variable | Notebook 3 | Lambda Code Default<br/>(if not deployed) | Deployed via Script<br/>(`deploy_lambda_container.sh`) | Where to Change |
+|----------|------------|-------------------------------------------|--------------------------------------------------------|-----------------|
+| `MIN_SAMPLES` | **50** | **100** | **100** (inherits code default) | Notebook: line 1027<br/>Lambda: env var or code line 61 |
+| `DATA_DRIFT_LOOKBACK_DAYS` | incremental* | **7 days** | **1 day** ⚠️ | **Script line 315**<br/>Or pass as Lambda env var |
+| `MODEL_DRIFT_LOOKBACK_DAYS` | **30 days** | **30 days** | **1 day** ⚠️ | **Script line 316**<br/>Or pass as Lambda env var |
+| `DATA_DRIFT_THRESHOLD` | **0.20** (20%) | **0.2** | **0.2** (script arg 2) | Script argument<br/>`config.yaml` drift_thresholds.data_drift<br/>Lambda env var |
+| `MODEL_DRIFT_THRESHOLD` | **0.05** (5%) | **0.05** | **0.05** (script arg 3) | Script argument<br/>`config.yaml` drift_thresholds.model_drift<br/>Lambda env var |
+| `KS_PVALUE_THRESHOLD` | (not set) | **0.05** | **0.05** (inherits code default) | Lambda env var or code line 59 |
+
+**\*Notebook incremental mode:** Notebook 3 queries `MAX(monitoring_timestamp)` from the last drift run and only analyzes predictions since that timestamp. This avoids re-analyzing the same data on each notebook re-run. The Lambda uses fixed rolling windows instead.
+
+**⚠️ Critical:** The deployment script **hardcodes 1-day lookback windows** (lines 315-316), overriding the Lambda code defaults of 7/30 days. This means:
+- **As deployed**: Lambda analyzes last 1 day of predictions for both data and model drift
+- **Lambda code says**: 7 days for data drift, 30 days for model drift (ignored when deployed via script)
+- **Why 1 day?** Designed for daily scheduled runs where you want to detect drift in yesterday's predictions, not a rolling multi-day window
+
+**To use longer lookback windows in production:**
+1. Edit `scripts/deploy_lambda_container.sh` lines 315-316 to desired values (e.g., `"7"` and `"30"`)
+2. Redeploy: `cd scripts && ./deploy_lambda_container.sh your-email@example.com`
+3. Or update Lambda environment variables directly via AWS console / CLI after deployment
+
+**When to use each:**
+- **1 day (deployed default)**: Daily monitoring of yesterday's predictions, fast alerts for sudden drift
+- **7/30 days (code default)**: Smoothed trends, better statistical significance, tolerates low daily volume
+- **Incremental (notebook)**: Interactive testing without re-processing already-analyzed predictions
+
+### Configuring Shorter Drift Windows (Minutes Instead of Days)
+
+For high-volume real-time applications, you may want drift detection to run every 15 minutes instead of daily. This requires converting the lookback windows from days to minutes:
+
+**Use case:** Detect drift within the hour on high-throughput endpoints (100s-1000s predictions/minute) rather than waiting for daily batch checks.
+
+**Step-by-step conversion:**
+
+1. **Update deployment script** (`scripts/deploy_lambda_container.sh` lines 315-316):
+   
+   Replace:
+   ```bash
+   "DATA_DRIFT_LOOKBACK_DAYS": "1",
+   "MODEL_DRIFT_LOOKBACK_DAYS": "1",
+   ```
+   
+   With:
+   ```bash
+   "DATA_DRIFT_LOOKBACK_MINUTES": "60",
+   "MODEL_DRIFT_LOOKBACK_MINUTES": "120",
+   ```
+
+2. **Update Lambda code** (`src/drift_monitoring/lambda_drift_monitor.py` lines 64-65):
+   
+   Replace:
+   ```python
+   DATA_DRIFT_LOOKBACK_DAYS = int(os.getenv('DATA_DRIFT_LOOKBACK_DAYS', '7'))
+   MODEL_DRIFT_LOOKBACK_DAYS = int(os.getenv('MODEL_DRIFT_LOOKBACK_DAYS', '30'))
+   ```
+   
+   With:
+   ```python
+   DATA_DRIFT_LOOKBACK_MINUTES = int(os.getenv('DATA_DRIFT_LOOKBACK_MINUTES', '60'))
+   MODEL_DRIFT_LOOKBACK_MINUTES = int(os.getenv('MODEL_DRIFT_LOOKBACK_MINUTES', '120'))
+   ```
+
+3. **Update drift functions** (same file):
+   
+   In `check_data_drift()` function (around line 431), replace:
+   ```python
+   lookback_start = (datetime.now() - timedelta(days=DATA_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   With:
+   ```python
+   lookback_start = (datetime.now() - timedelta(minutes=DATA_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   In `check_model_drift()` function (around line 526), replace:
+   ```python
+   lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+   
+   With:
+   ```python
+   lookback_start = (datetime.now() - timedelta(minutes=MODEL_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+   ```
+
+4. **Update EventBridge schedule** (in `scripts/deploy_lambda_container.sh` line 64 or `src/config/config.yaml`):
+   
+   In deployment script, the schedule is read from config. Update `config.yaml`:
+   ```yaml
+   drift_monitor:
+     schedule: "rate(15 minutes)"  # Was: "cron(0 2 * * ? *)"
+   ```
+
+5. **Optional: Update notebook constants** (`src/config/config.py`):
+   
+   For consistency with notebook 3, rename:
+   ```python
+   # Old:
+   MONITORING_DATA_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('data_drift_lookback_days', 7)
+   MONITORING_MODEL_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('model_drift_lookback_days', 30)
+   
+   # New:
+   MONITORING_DATA_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('data_drift_lookback_minutes', 60)
+   MONITORING_MODEL_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('model_drift_lookback_minutes', 120)
+   ```
+
+6. **Redeploy:**
+   ```bash
+   cd scripts
+   ./deploy_lambda_container.sh your-email@example.com
+   ```
+
+**Expected behavior after conversion:**
+- Lambda runs every 15 minutes (vs. daily at 2 AM)
+- Data drift: analyzes last 60 minutes of predictions
+- Model drift: analyzes last 120 minutes of predictions with ground truth
+- Faster drift detection but higher Lambda invocation costs
+- More sensitive to short-term anomalies (weekday vs. weekend patterns, lunch-hour spikes)
+
+**Cost considerations:**
+- Daily schedule: ~30 Lambda invocations/month
+- 15-minute schedule: ~2,880 Lambda invocations/month (96x more)
+- With 512 MB memory and 60s avg runtime: ~$3-5/month → ~$200-300/month
+- Use minute-based windows only when real-time drift detection justifies the cost
 - **Per-run traceability** — Each drift run gets a `monitoring_run_id` (`notebook-drift-*` from the notebook, `drift-*` from the Lambda). Both writers (a) record one row in `monitoring_responses` keyed on this id, and (b) backfill the same id onto the `inference_responses` rows the run scored — `WHERE monitoring_run_id IS NULL` makes this naturally delta-shaped, so each run only tags predictions never measured before. QuickSight can join the two tables on `monitoring_run_id` to show "what predictions did this run measure?". The **notebook additionally** scopes the *drift compute window itself* to `request_timestamp > MAX(monitoring_timestamp)`, letting you re-run drift detection on just the new predictions since the last run.
 - **Automated daily checks** — EventBridge → Lambda (`fraud-detection-drift-monitor`) at 2 AM UTC. Writes summary to `monitoring_responses` (Athena is the durable source of truth — QuickSight reads directly from here), optionally logs metrics + Evidently HTML reports to MLflow, sends SNS alert if drift exceeds thresholds. Lambda scopes its drift compute to fixed 7/30-day rolling windows (data drift / model drift respectively); the `monitoring_run_id` backfill runs after every Lambda invocation.
 
 ### Governance (Notebook 4)
-QuickSight dashboard with three tabs and **30 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every tab ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
+QuickSight dashboard with three sheets and **32 visuals** — each visual answers a specific "how is X drifting at Y granularity?" question. Every sheet ends with a raw source-data table so you can inspect the exact `monitoring_responses` / `inference_responses` / `feature_drift_detail` rows powering the charts.
+
+> 📊 **Creating Custom Visualizations**: Beyond the pre-built 32 visuals, QuickSight Q allows you to create custom charts using natural language queries. See the [QuickSight Natural Language Query Guide](docs/screenshots/quicksight/README.md#creating-custom-visualizations-with-natural-language) for sample queries like "Show me top 5 drifted features over the last 30 days with a threshold line" or "Create a Sankey diagram showing prediction distribution shifts".
 
 **Tab 1 — Model Drift Trends (11 visuals):**
 
@@ -279,14 +490,16 @@ QuickSight dashboard with three tabs and **30 visuals** — each visual answers 
 - **Inference volume vs drift share correlation** (combo chart) — spikes in traffic often cause spurious drift on small feature subsets.
 - **Source-data table** — every `monitoring_responses` row with fields for cross-referencing.
 
-**Tab 3 — Feature Drift Trends (9 visuals):**
+**Tab 3 — Feature Drift Trends (11 visuals):**
 
-- **Per-feature trend**: drift-score timeline colored by feature, feature-drift heatmap over time (features × days), highest-current drift KPI.
-- **Ranking**: top-15 most-drifting features (avg score), severity distribution across top-15.
-- **Max feature drift score per run** — the *worst* feature per run, colored by model version. Moderate averages (Tab 2's D1) can hide one catastrophically-drifted feature; this visual makes the peak visible.
+- **Per-feature trend**: `drift_magnitude` timeline colored by feature (reference line at magnitude = 1.0), feature-drift-magnitude heatmap over time (features × days), highest-magnitude KPI.
+- **Ranking**: top-15 most-drifting features (avg `drift_magnitude`), severity distribution across top-15 (`Low <1.0` / `Moderate ≥1.0` / `Significant ≥3.0`).
+- **Max feature drift magnitude per run** — the *worst* feature per run, colored by model version. Moderate averages (Tab 2's D1) can hide one catastrophically-drifted feature; this visual makes the peak visible.
 - **Repeat-offender features** — count of runs each feature has been flagged in. Chronic drifters → retraining candidates. One-off spikes → data-quality issues.
 - **Cross-model heatmap** — feature × `model_version` pivot. "Is this feature drifting consistently across our retrained models, or was it a training-artifact of one specific version?"
-- **Per-feature detail table** — every run × feature × severity × model_version row for lookup.
+- **Raw `drift_score` — p-value tests** (KS / Chi-square, filtered to `drift_method` containing `p_value`): LOWER = more drift, reference line at 0.05. For auditing the underlying test statistic on features where Evidently chose a p-value test.
+- **Raw `drift_score` — distance tests** (Wasserstein / Jensen-Shannon / PSI, filtered to `drift_method` containing `distance`): HIGHER = more drift, reference line at 0.1. The distance-test counterpart — kept separate because raw scores from the two test families are not comparable.
+- **Per-feature detail table** — every run × feature showing both raw `drift_score` AND normalized `drift_magnitude` alongside `drift_method` and severity, so you can see the raw statistic and the test-agnostic number side by side.
 
 **How the tabs work together:**
 
@@ -347,6 +560,8 @@ sagemaker-automated-drift-and-trend-monitoring/
 ## MLOps Lineage & Reproducibility
 
 > The principle: **anything that participates in a model's lineage must be addressable by an immutable reference. Names are pointers. Pointers are fine for humans, fatal for joins.**
+
+**Production ML drift detection is only meaningful if the baseline is frozen per model version.** The training pipeline writes a `baseline.json` artifact alongside every model — recording the evaluation metrics, the Iceberg snapshot ID of the `evaluation_data` slice the model was scored on, the code commit SHA that produced the pipeline, and the feature schema version. This file is registered as the ModelPackage's `ModelStatistics` URI in the SageMaker AI Model Registry. On every run, the drift Lambda resolves what is currently serving production by walking `describe_endpoint` → `endpoint_config` → `model` → `ModelPackageName`, then loads that package's `baseline.json`. For data drift it reads `evaluation_data FOR VERSION AS OF` the pinned snapshot ID (Iceberg time travel) — so re-seeding the table later cannot retroactively corrupt the historical baseline. For model drift it compares current ROC-AUC against the metric in `baseline.json` — no hardcoded thresholds, no stale env vars. Every result is written to `monitoring_responses` stamped with the ModelPackage ARN and snapshot ID, and to MLflow with the same fields as tags. QuickSight can then slice ROC-AUC trends per model version without silently mixing baselines.
 
 Five immutable references anchor every model in this system:
 
@@ -468,10 +683,18 @@ Then re-launch the JupyterLab Space (the lifecycle script re-runs and recreates 
 **ML models degrade silently in production.** Most teams invest in training pipelines but leave inference monitoring as an afterthought. This solution closes that gap with an end-to-end, open-source MLOps system:
 
 - **Open-source SDKs** (MLflow, Evidently, scikit-learn) — portable across AWS/GCP/Azure/on-prem, no vendor lock-in
-- **Serverless cost profile** — scales to zero; ~$30–50/month for 1000 predictions/day vs. $200+/month for managed alternatives
+- **Serverless, usage-priced cost profile** — every compute component scales to zero when idle. See the [Cost](#cost) section below for a per-service breakdown.
 - **Production-grade** — handles delayed ground truth (typical in fraud), concept drift, multi-feature drift, and alerting
 - **Custom inference handler** — automatic prediction logging with zero added latency (fire-and-forget SQS → batched Lambda → Athena)
 - **Independent monitoring backends** — MLflow (per-run experiment tracking, Evidently HTML artifacts) and QuickSight (Athena-backed dashboards) both consume the same `monitoring_responses` table; use either, both, or neither depending on workload (see [Choosing a Monitoring Backend](#choosing-a-monitoring-backend))
+
+### Cost
+
+The full solution — including SageMaker AI **MLflow Apps** (usage-priced, serverless — replaces the older EC2-backed MLflow Tracking Server, so there is no hourly `ml.*` instance charge for tracking), SageMaker **Serverless Inference**, Lambda, EventBridge, Athena, S3, SQS, SNS, and QuickSight — costs in the range of **~$60/month** for a demo-scale deployment, depending on instance type and usage patterns. This figure is directional and will vary based on inference volume, data retention policies, and regional pricing.
+
+Every compute component here is serverless or usage-priced: serverless endpoints charge only for actual invocations (no baseline instance hours), MLflow Apps charge per API call, Lambdas execute on-demand, Athena queries run only when triggered, and EventBridge incurs no cost between scheduled runs. High-volume deployments scale linearly with actual work, with no upfront capacity planning or reserved instances required. Compared to always-on managed MLOps platforms that carry per-hour compute floors ($200+/month baseline before any inference), the same architecture scales from a much lower floor.
+
+For a per-service directional breakdown, see [`docs/ARCHITECTURE_STEPS.md`](docs/ARCHITECTURE_STEPS.md#-configuration-files) → **Cost (Monthly)** section. The cost estimates are based on pricing as of this writing — for latest prices see [Amazon SageMaker AI pricing](https://aws.amazon.com/sagemaker/ai/pricing/).
 
 ### Why Not SageMaker `DataCaptureConfig`?
 
@@ -532,6 +755,62 @@ Every drift run persists to Athena (`monitoring_responses` + `inference_response
 
 For QuickSight consumers, the same content is available as time-series visuals directly off `monitoring_responses` — no MLflow required. Screenshots of the Evidently reports live in `docs/screenshots/evidently/`; the QuickSight dashboard screenshots (drift-score aggregation views, feature-drift timeline) live in `docs/screenshots/quicksight/`.
 
+### The drift story, end to end (worked example)
+
+The three QuickSight sheets are designed to be read in order — **model → data → feature → (explainability)** — so an on-call engineer can go from "is the model still healthy?" to "which feature broke it, and does it actually matter?" in four glances. The screenshots below are a real run of this repo against the fraud-detection demo data. Full-page exports live in [`docs/screenshots/quicksight/`](docs/screenshots/quicksight/) ([`Model_Drift_Trends.pdf`](docs/screenshots/quicksight/Model_Drift_Trends.pdf), [`Data_Drift_Trends.pdf`](docs/screenshots/quicksight/Data_Drift_Trends.pdf), [`Feature_Drift_Trends.pdf`](docs/screenshots/quicksight/Feature_Drift_Trends.pdf)); the cropped panels are in [`docs/screenshots/quicksight/narrative/`](docs/screenshots/quicksight/narrative/).
+
+**1. The model degraded — start here.** ROC-AUC collapsed from the frozen baseline of **~0.98** to a current **~0.48** — roughly a **51% degradation**, and the model-drift verdict fired on 100% of runs. This is the symptom; the next two sheets explain the cause.
+
+![ROC-AUC baseline vs current](docs/screenshots/quicksight/narrative/model_rocauc_baseline_vs_current.png)
+
+**1a. Why accuracy alone would have hidden this failure.** The Model Drift sheet also tracks accuracy, precision, recall, and F1 as separate lines — and this is the visual that shows why you need *all four*, not just accuracy:
+
+![Model performance metrics: accuracy stays high while precision, recall, F1 collapse](docs/screenshots/quicksight/narrative/model_perf_accuracy_masks_zero_precision_recall.png)
+
+Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and F1 all sit at 0** (they overlap into a single line along the x-axis). If the dashboard reported only accuracy, an on-call engineer would have concluded "0.85 — nothing wrong here" and moved on. The ROC-AUC + precision + recall + F1 lines together reveal the truth: the model has silently **collapsed to predicting the majority class (`non-fraud`) on every transaction**. It looks accurate because ~99.8% of real credit-card transactions genuinely are non-fraud in the Kaggle dataset — but *zero actual fraud is being caught*.
+
+> **Why does this happen, and is it an artifact of the ground-truth simulator?** No — the simulator's flip logic is symmetric (`~df.loc[error_indices, 'actual_fraud']` in `simulate_ground_truth_from_athena.py:170` flips both directions). The collapse to `precision = recall = 0` comes from the model side: under drifted inputs, XGBoost's fraud probability drops below the `0.5` decision threshold on essentially every row (ROC-AUC ~0.48 confirms near-random behavior on the score), so **every prediction is `0`**. Once every prediction is a single class, `TP = FP = 0` — and precision (TP/(TP+FP)) and recall (TP/(TP+FN)) are both structurally zero regardless of what the ground-truth side does. Accuracy stays high because the ground truth is mostly `0` too, and matching `0 → 0` counts as correct. **This is the class of failure that dashboards must catch and single-metric monitoring will miss** — the drift alert in this solution therefore fires on `roc_auc_degradation`, not on accuracy.
+
+**2. The inputs shifted — the "why".** The data-drift sheet shows **~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns) with alerts firing. Widespread input drift is exactly what you'd expect to precede a performance collapse.
+
+![Data drift share over time](docs/screenshots/quicksight/narrative/data_drift_share_over_time.png)
+
+**3. Which features, and how badly.** The feature sheet ranks every column by **`drift_magnitude`** — a test-agnostic "× past threshold" number (`1.0` = at threshold, higher = worse) that stays comparable across features no matter which statistical test Evidently auto-picked. `num_transactions_24h` is the worst offender at **~11× threshold**; the KPI tile confirms the single worst feature-run at **12.76×**.
+
+![Top drifted features by magnitude](docs/screenshots/quicksight/narrative/feat_top15_drifted.png)
+
+> **Why `drift_magnitude` and not raw `drift_score`?** Evidently picks a different test per column (KS p-value for some, Wasserstein distance for others), and those raw scores move in opposite directions and live on incomparable scales. Ranking on raw score is meaningless across a mixed set of tests — see [drift_score vs drift_magnitude](#drift_score-vs-drift_magnitude--the-two-fields-and-which-one-to-trust). (An earlier version of these screenshots plotted raw `drift_score` and was dominated by a single mis-scaled feature reading ~1000; those misleading images have been removed in favor of the magnitude-based views here.)
+
+**4. Does the drift actually matter? Cross-reference SHAP.** Drift magnitude tells you *what changed*; SHAP (from [`7_optional_shap_explainability.ipynb`](notebooks/7_optional_shap_explainability.ipynb)) tells you *what the model relies on*. The intersection is what you act on. Two complementary SHAP views are worth looking at side by side:
+
+![SHAP feature importance — mean absolute magnitude](docs/screenshots/quicksight/narrative/shap_feature_importance.png)
+
+*Bar chart — mean absolute SHAP value per feature.* Answers "**how much** does this feature move the prediction on average?" `account_age_days` (0.37) and `num_transactions_24h` (0.29) dominate — those two are what the model relies on most. But this chart shows magnitude only; positive and negative pushes get collapsed into one bar, so it can't tell you *which direction* a high or low value nudges the prediction.
+
+![SHAP beeswarm — signed impact by feature value](docs/screenshots/quicksight/narrative/SHAP-beeswarm-plot.png)
+
+*Beeswarm plot — signed SHAP per prediction, colored by feature value (blue = low, red = high).* Answers "**in which direction** does this feature push?" Each dot is one prediction; horizontal position is the SHAP value (right = pushes toward fraud, left = pushes toward non-fraud). For `account_age_days`, red dots (high account age) cluster on the left and blue dots (low account age) cluster on the right — meaning **older accounts push predictions away from fraud, newer accounts push toward fraud**, the inverse relationship you'd expect from domain intuition. `num_transactions_24h` (row 2) shows a more mixed pattern with color present at both extremes — its relationship is non-monotonic, consistent with it being a PCA-transformed feature (Kaggle's V14 renamed for readability).
+
+**When you combine the two SHAP views with the drift chart:** the bar chart tells you the drifted feature is important, the beeswarm tells you *how* current input shifts translate into prediction shifts. If a drifted feature's beeswarm shows a strong monotonic pattern (like `account_age_days`), you can predict the direction of the ROC-AUC collapse; if it's non-monotonic, the failure mode is harder to reason about analytically and retraining is usually the answer.
+
+| Feature | Drift magnitude | SHAP importance (rank) | Verdict |
+|---|---|---|---|
+| `num_transactions_24h` | **×10.9** (worst) | **0.294 (#2)** | 🔴 **High-risk** — a top-2 driver of the model is also the most-drifted feature. This is the primary suspect for the ROC-AUC collapse. |
+| `account_age_days` | ×2.1 | **0.365 (#1)** | 🔴 **High-risk** — the single most important feature is drifting. |
+| `customer_age`, `transaction_amount` | ×2.4, ×2.3 | 0.104, 0.083 (#7, #8) | 🟠 Important *and* drifting — monitor / retrain. |
+| `customer_gender` | ×4.9 (2nd-worst drift) | **0.001 (#30, last)** | 🟢 **Low-risk noise** — heavily drifted, but the model effectively ignores this feature, so the drift is unlikely to affect predictions. Don't waste a retraining cycle on it. |
+
+**The payoff:** ranked by drift alone, you'd chase `customer_gender` (2nd-worst drift). Ranked by drift **×** SHAP importance, the real culprit is `num_transactions_24h` — high drift on a feature the model leans on hard, which coherently explains the performance drop in step 1. This is the difference between a dashboard that lists anomalies and one that tells you what to do about them.
+
+> ⚠️ **The QuickSight ranking above is not "discovering" what SHAP found — read this carefully before drawing conclusions from the alignment.**
+>
+> QuickSight only visualizes Evidently's distance / p-value statistics between the baseline and current distributions. It has no access to the trained model and no notion of feature importance. The reason `num_transactions_24h` ranks worst in the drift chart *and* ranks #2 in SHAP is a **property of this demo, not an emergent discovery**:
+>
+> - The `drift_generation.default_drift` block in `src/config/config.yaml` (lines ~295-316) is what determines the shape and magnitude of drift injected into the demo dataset. The author picked five features to drift and tuned the shift/factor per feature. `num_transactions_24h` gets an additive `shift: 1` — and because that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`, renamed for readability — see `src/setup/download_kaggle_dataset.py:71`), a +1 shift moves the distribution by ~1σ. Evidently's normed Wasserstein turns that into a magnitude of ~10×. The other drifted features get multiplicative factors of 1.1×–1.2× on wider-range columns, which produce magnitudes of only ~2–4×. **The ranking you see in the chart falls straight out of these config choices.**
+> - SHAP importance is computed offline against the trained model in `notebooks/7_optional_shap_explainability.ipynb`. It reflects what the model actually relies on, and it doesn't change if you edit the drift config.
+> - **What happens if you change the config?** Edit `config.yaml` — bump `distance_from_home_km`'s factor from 1.2 → 1.5, or drop `num_transactions_24h`'s shift from 1 → 0.1 — and the QuickSight ranking will reshuffle to match your new config on the very next drift run. **The SHAP chart will not move**, because retuning drift generation doesn't retrain the model. That asymmetry is the point: SHAP tells you what mattered to the model regardless of what synthetic scenario you're simulating this month.
+> - **What this teaches.** The demo is set up so drift alignment with SHAP looks meaningful because the config author drifted a feature that also happens to be top-SHAP. In real production drift there's no reason those would line up. The right takeaway is the *methodology* — always cross-reference drift with SHAP before prioritizing — not "QuickSight tends to surface important features."
+
 ### Reading drift scores in the dashboards
 
 Two aggregations of the same `drift_score` column tell you different things — the current dashboard has both, and switching between them in QuickSight (the aggregation dropdown on any drift-score visual) is a first-class debugging tool:
@@ -539,7 +818,10 @@ Two aggregations of the same `drift_score` column tell you different things — 
 - **Average drift score per feature** (dashboard default) — the standard "how bad is this feature on average" view. `credit_limit` at 5.8 for a month means it's chronically slightly-drifted. Best for prioritizing which feature to investigate first.
 - **Variance (population) of drift score per feature** — how *unstable* the drift is. Same feature with average 30 and variance 0.4 means "consistently drifts at ~30" (systematic shift, retraining candidate). Same feature with average 30 and variance 1090 means "some runs 0, some runs 95" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
 
-For a systematic drift, Average is high AND Variance is low. For sporadic data-quality issues, Average is low AND Variance is high relative to it. Use both together when triaging.
+- **Average drift magnitude per feature** (dashboard default) — "how bad is this feature on average". `num_transactions_24h` at `10.9` for a month means it's chronically ~11× past threshold. Best for prioritizing which feature to investigate first.
+- **Variance (population) of drift magnitude per feature** — how *unstable* the drift is. Same feature with average 3 and variance 0.1 = consistent systematic drift at ~3× (retraining candidate). Average 3 and variance 12 = "some runs near threshold, some runs 8×" (sporadic — likely a data-quality issue on specific days). QuickSight computes this natively: click the value field on the visual → **Aggregate** → **Variance (Population)**.
+
+For systematic drift: Average is high AND Variance is low. For sporadic data-quality issues: Average is low AND Variance is high relative to it. Use both together when triaging.
 
 ### PSI math, briefly
 

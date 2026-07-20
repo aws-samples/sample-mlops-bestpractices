@@ -314,12 +314,14 @@ GROUP BY DATE_TRUNC('day', request_timestamp);
 - Dashboard refresh: <30s (Step 11, on-demand)
 
 **Cost (Monthly):**
-- SageMaker Endpoint: ~$50-100 (depends on instance type)
-- Lambda: ~$5 (millions of invocations free tier)
-- Athena: ~$10 (query volume dependent)
-- S3: ~$5 (storage + lifecycle policies)
-- QuickSight: $0-24 (Reader/Author licenses)
-- **Total: ~$30-150/month** (vs $200+ for managed alternatives)
+- SageMaker Serverless Inference: pay-per-invocation (scales to zero when idle — no baseline instance hours)
+- SageMaker AI **MLflow App** (serverless, usage-priced) — replaces the older EC2-backed MLflow Tracking Server, so there is no hourly `ml.*` instance charge for tracking. Cost is per API call / storage.
+- Lambda (drift monitor + inference logger + writer): ~$5 (invocation and duration; falls well inside the free tier for typical demo workloads)
+- Athena: ~$10 (query volume dependent — Iceberg partitioning cuts scan cost 10-100×)
+- S3: ~$5 (storage + Iceberg data lake + lifecycle policies)
+- EventBridge + SQS + SNS: negligible (well under $1 for scheduled and event-driven traffic at this volume)
+- QuickSight: $24/author/month, $5/reader (capped at $500/month per group)
+- **Total: ~$60/month directional** for a demo-scale deployment. Compared to always-on managed MLOps platforms that carry per-hour compute floors ($200+/month baseline before any inference), the serverless + usage-priced stack scales linearly with actual work — high-volume deployments still scale linearly, just from a much lower floor.
 
 **Scalability:**
 - Inference: Auto-scales 1-3 instances (Step 5)

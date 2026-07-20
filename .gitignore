@@ -40,6 +40,10 @@ wheels/
 venv/
 ENV/
 
+# Jupyter checkpoints
+sagemaker-automated-drift-and-trend-monitoring/.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
 # IDE
 .idea/
 .vscode/

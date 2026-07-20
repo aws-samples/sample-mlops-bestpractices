@@ -265,6 +265,28 @@ else
     echo "  ✓ Image built and pushed via CodeBuild: $IMAGE_URI"
 fi
 
+# Resolve the :latest tag to its immutable digest and deploy BY DIGEST.
+#
+# Why: `aws lambda update-function-code --image-uri ...:latest` pins whatever
+# digest :latest resolves to AT THAT INSTANT and never re-resolves it on
+# invocation. If a newer image is later pushed to :latest without re-running
+# this deploy, the function silently keeps running the old digest. Deploying
+# by the digest we JUST pushed makes "the function runs this exact image" an
+# explicit, verifiable fact instead of a race against tag mutation.
+IMAGE_DIGEST=$(aws ecr describe-images \
+    --repository-name "$REPO_NAME" \
+    --image-ids imageTag=latest \
+    --region "$REGION" \
+    --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || echo "None")
+if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+    echo "  ✗ ERROR: could not resolve a digest for $REPO_NAME:latest in ECR."
+    echo "    The image build/push step above did not produce an image — aborting"
+    echo "    rather than leaving the Lambda on a stale digest."
+    exit 1
+fi
+IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$REPO_NAME@$IMAGE_DIGEST"
+echo "  ✓ Deploying pinned digest: $IMAGE_URI"
+
 # Step 5: Create/Update Lambda function
 echo ""
 echo "[5/7] Deploying Lambda function..."
@@ -330,7 +352,12 @@ cat > "$ENV_FILE" <<EOF
 EOF
 
 # Check if function exists
-FUNCTION_EXISTS=$(aws lambda get-function --function-name $LAMBDA_NAME --region $REGION 2>/dev/null && echo "true" || echo "false")
+# Suppress stdout too (>/dev/null): `aws lambda get-function` prints the full
+# function JSON on success, which would otherwise be captured into
+# FUNCTION_EXISTS along with the trailing "true" — making it match neither
+# "true" nor "false" below, so BOTH the update and create branches were
+# silently skipped and the function was never repointed to the new image.
+FUNCTION_EXISTS=$(aws lambda get-function --function-name $LAMBDA_NAME --region $REGION >/dev/null 2>&1 && echo "true" || echo "false")
 
 if [ "$FUNCTION_EXISTS" = "true" ]; then
     CURRENT_PKG_TYPE=$(aws lambda get-function-configuration --function-name $LAMBDA_NAME --region $REGION --query 'PackageType' --output text)
@@ -374,6 +401,21 @@ fi
 
 FUNCTION_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 echo "  ✓ Lambda: $FUNCTION_ARN"
+
+# Verify the function actually resolved to the digest we just deployed.
+# Guards against a silently-stale function (e.g. a skipped/failed push, or a
+# tag that moved between resolve and deploy). Fail loudly if they diverge.
+aws lambda wait function-updated-v2 --function-name $LAMBDA_NAME --region $REGION 2>/dev/null || true
+DEPLOYED_IMAGE=$(aws lambda get-function --function-name $LAMBDA_NAME --region $REGION \
+    --query 'Code.ResolvedImageUri' --output text 2>/dev/null || echo "")
+DEPLOYED_DIGEST="${DEPLOYED_IMAGE##*@}"
+if [ "$DEPLOYED_DIGEST" = "$IMAGE_DIGEST" ]; then
+    echo "  ✓ Verified: Lambda is running the just-built image ($IMAGE_DIGEST)"
+else
+    echo "  ✗ ERROR: Lambda is running $DEPLOYED_DIGEST but expected $IMAGE_DIGEST."
+    echo "    The function did NOT pick up the new image. Re-run this deploy."
+    exit 1
+fi
 
 # Step 6: EventBridge Rule
 echo ""

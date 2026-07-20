@@ -246,6 +246,14 @@ def write_to_athena(data):
         lambda_client.get_waiter('function_updated_v2').wait(FunctionName=lambda_name)
         lambda_client.update_function_configuration(
             FunctionName=lambda_name,
+            # Handler MUST be updated here too: an older deploy of this
+            # function shipped the code as `index.py`
+            # (Handler=index.lambda_handler). We now package it as
+            # `lambda_function.py`, so without repinning the handler the
+            # updated code loads under a module name the handler no longer
+            # points at — every invocation fails with a handler-not-found
+            # import error and results are silently never written to Athena.
+            Handler='lambda_function.lambda_handler',
             Timeout=60,
             MemorySize=256,
             Environment={'Variables': env_vars}
