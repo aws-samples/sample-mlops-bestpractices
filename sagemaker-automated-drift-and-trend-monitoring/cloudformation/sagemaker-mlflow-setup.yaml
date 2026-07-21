@@ -1466,6 +1466,10 @@ Resources:
           ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
           ATHENA_OUTPUT_S3 = os.getenv('ATHENA_OUTPUT_S3')
 
+          # KEEP IN SYNC: column list must match:
+          #   1. The Athena inference_responses DDL (src/setup/create_athena_tables.py)
+          #   2. The fields the inference handler sends via SQS (src/train_pipeline/inference_code/inference.py)
+          # Column names are schema-driven — identifier_column comes from dataset_schema.yaml.
           COLUMNS = [
               ('inference_id', 'varchar'),
               ('request_timestamp', 'timestamp'),
@@ -1474,8 +1478,8 @@ Resources:
               ('mlflow_run_id', 'varchar'),
               ('input_features', 'varchar'),
               ('prediction', 'integer'),
-              ('probability_fraud', 'double'),
-              ('probability_non_fraud', 'double'),
+              ('probability_positive', 'double'),
+              ('probability_negative', 'double'),
               ('confidence_score', 'double'),
               ('ground_truth', 'integer'),
               ('ground_truth_timestamp', 'timestamp'),
@@ -1484,9 +1488,7 @@ Resources:
               ('inference_latency_ms', 'double'),
               ('model_load_time_ms', 'double'),
               ('preprocessing_time_ms', 'double'),
-              ('transaction_id', 'varchar'),
-              ('transaction_amount', 'double'),
-              ('customer_id', 'varchar'),
+              ('client_id', 'varchar'),
               ('is_high_confidence', 'boolean'),
               ('is_low_confidence', 'boolean'),
               ('prediction_bucket', 'varchar'),
