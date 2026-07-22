@@ -1087,18 +1087,36 @@ SELECT
     drifted_columns_share,
     baseline_roc_auc,
     current_roc_auc,
-    feature_name,                    -- Unpacked from JSON
-    drift_score,                     -- Unpacked from JSON
+    feature_name,
+    COALESCE(
+        TRY(CAST(json_format(feature_value) AS DOUBLE)),
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.score') AS DOUBLE))
+    ) as drift_score,
+    COALESCE(
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+        TRY(CAST(json_format(feature_value) AS DOUBLE))
+    ) as drift_magnitude,
+    TRY(json_extract_scalar(json_format(feature_value), '$.method')) as drift_method,
+    TRY(CAST(json_extract_scalar(json_format(feature_value), '$.threshold') AS DOUBLE)) as drift_threshold,
     CASE
-        WHEN drift_score > 0.25 THEN 'Significant'
-        WHEN drift_score > 0.1 THEN 'Moderate'
+        WHEN COALESCE(
+            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+            TRY(CAST(json_format(feature_value) AS DOUBLE))
+        ) > 2.5 THEN 'Significant'
+        WHEN COALESCE(
+            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+            TRY(CAST(json_format(feature_value) AS DOUBLE))
+        ) > 1.0 THEN 'Moderate'
         ELSE 'Low'
-    END as drift_severity,           -- Computed severity
-    CASE WHEN drift_score > 0.1 THEN true ELSE false END as drift_detected
+    END as drift_severity,
+    CASE WHEN COALESCE(
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+        TRY(CAST(json_format(feature_value) AS DOUBLE))
+    ) > 1.0 THEN true ELSE false END as drift_detected
 FROM {resolved_database}.monitoring_responses
 CROSS JOIN UNNEST(
-    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, DOUBLE))
-) AS t(feature_name, drift_score)
+    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, JSON))
+) AS t(feature_name, feature_value)
 WHERE per_feature_drift_scores IS NOT NULL
     AND per_feature_drift_scores != 'null'
     AND per_feature_drift_scores != '{{}}'
@@ -2008,6 +2026,17 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     """
     def flcol(name):
         return {'DataSetIdentifier': DS_IDENT_FEATURE_LEVEL, 'ColumnName': name}
+
+    # Reference line at magnitude = 1.0 (drifted threshold: magnitude >= 1.0 means drifted)
+    magnitude_ref_line_1 = [{
+        'Status': 'ENABLED',
+        'DataConfiguration': {'StaticConfiguration': {'Value': 1.0}, 'AxisBinding': 'PRIMARY_YAXIS'},
+        'StyleConfiguration': {'Pattern': 'DASHED', 'Color': '#C00000'},
+        'LabelConfiguration': {
+            'CustomLabelConfiguration': {'CustomLabel': 'magnitude = 1.0 (above = drifted)'},
+            'FontConfiguration': {'FontSize': {'Relative': 'SMALL'}},
+        },
+    }]
 
     f1_score_timeline = {
         'LineChartVisual': {
