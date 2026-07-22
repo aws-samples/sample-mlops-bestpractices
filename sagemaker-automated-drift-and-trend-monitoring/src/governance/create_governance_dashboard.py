@@ -1087,18 +1087,36 @@ SELECT
     drifted_columns_share,
     baseline_roc_auc,
     current_roc_auc,
-    feature_name,                    -- Unpacked from JSON
-    drift_score,                     -- Unpacked from JSON
+    feature_name,
+    COALESCE(
+        TRY(CAST(json_format(feature_value) AS DOUBLE)),
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.score') AS DOUBLE))
+    ) as drift_score,
+    COALESCE(
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+        TRY(CAST(json_format(feature_value) AS DOUBLE))
+    ) as drift_magnitude,
+    TRY(json_extract_scalar(json_format(feature_value), '$.method')) as drift_method,
+    TRY(CAST(json_extract_scalar(json_format(feature_value), '$.threshold') AS DOUBLE)) as drift_threshold,
     CASE
-        WHEN drift_score > 0.25 THEN 'Significant'
-        WHEN drift_score > 0.1 THEN 'Moderate'
+        WHEN COALESCE(
+            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+            TRY(CAST(json_format(feature_value) AS DOUBLE))
+        ) > 2.5 THEN 'Significant'
+        WHEN COALESCE(
+            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+            TRY(CAST(json_format(feature_value) AS DOUBLE))
+        ) > 1.0 THEN 'Moderate'
         ELSE 'Low'
-    END as drift_severity,           -- Computed severity
-    CASE WHEN drift_score > 0.1 THEN true ELSE false END as drift_detected
+    END as drift_severity,
+    CASE WHEN COALESCE(
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+        TRY(CAST(json_format(feature_value) AS DOUBLE))
+    ) > 1.0 THEN true ELSE false END as drift_detected
 FROM {resolved_database}.monitoring_responses
 CROSS JOIN UNNEST(
-    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, DOUBLE))
-) AS t(feature_name, drift_score)
+    CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, JSON))
+) AS t(feature_name, feature_value)
 WHERE per_feature_drift_scores IS NOT NULL
     AND per_feature_drift_scores != 'null'
     AND per_feature_drift_scores != '{{}}'
@@ -1481,6 +1499,7 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
         M6  Performance by Training Snapshot         (table)
         M7  Model Lineage Audit                      (table)
         M8  Latest Current ROC-AUC                   (KPI)
+        M12 Inference Latency (avg/max) Over Time     (line, by version)
     """
     def dcol(name):
         return {'DataSetIdentifier': DS_IDENT_DRIFT, 'ColumnName': name}
@@ -1716,6 +1735,34 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
         }
     }
 
+    # M12 — Inference Latency Over Time. Latency is a leading indicator of
+    # serving-side degradation that model-quality metrics never surface: a
+    # model can keep its ROC-AUC while the endpoint slows down (cold starts,
+    # payload growth, resource contention). Plotting AVERAGE alongside MAX
+    # exposes tail latency — the p-max spikes users actually feel — which an
+    # average alone hides. Bound to the inference dataset (inference_responses),
+    # where the handler-measured `inference_latency_ms` lives.
+    def icol(name):
+        return {'DataSetIdentifier': DS_IDENT_INFERENCE, 'ColumnName': name}
+
+    m12_inference_latency = {
+        'LineChartVisual': {
+            'VisualId': 'm12-inference-latency',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Inference Latency (ms) Over Time — Avg vs Max'}},
+            'ChartConfiguration': {
+                'FieldWells': {
+                    'LineChartAggregatedFieldWells': {
+                        'Category': [{'DateDimensionField': {'FieldId': 'm12-date', 'Column': icol('request_timestamp'), 'DateGranularity': 'DAY'}}],
+                        'Values': [
+                            {'NumericalMeasureField': {'FieldId': 'm12-avg', 'Column': icol('inference_latency_ms'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
+                            {'NumericalMeasureField': {'FieldId': 'm12-max', 'Column': icol('inference_latency_ms'), 'AggregationFunction': {'SimpleNumericalAggregation': 'MAX'}}},
+                        ],
+                    }
+                }
+            }
+        }
+    }
+
     return [
         m1_roc_auc_over_time,
         m2_perf_metrics_over_time,
@@ -1728,6 +1775,7 @@ def build_model_drift_visuals() -> List[Dict[str, Any]]:
         m9_confusion_matrix_trend,
         m10_degradation_pct,
         m11_gt_coverage,
+        m12_inference_latency,
     ]
 
 
@@ -1978,6 +2026,17 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     """
     def flcol(name):
         return {'DataSetIdentifier': DS_IDENT_FEATURE_LEVEL, 'ColumnName': name}
+
+    # Reference line at magnitude = 1.0 (drifted threshold: magnitude >= 1.0 means drifted)
+    magnitude_ref_line_1 = [{
+        'Status': 'ENABLED',
+        'DataConfiguration': {'StaticConfiguration': {'Value': 1.0}, 'AxisBinding': 'PRIMARY_YAXIS'},
+        'StyleConfiguration': {'Pattern': 'DASHED', 'Color': '#C00000'},
+        'LabelConfiguration': {
+            'CustomLabelConfiguration': {'CustomLabel': 'magnitude = 1.0 (above = drifted)'},
+            'FontConfiguration': {'FontSize': {'Relative': 'SMALL'}},
+        },
+    }]
 
     f1_score_timeline = {
         'LineChartVisual': {
