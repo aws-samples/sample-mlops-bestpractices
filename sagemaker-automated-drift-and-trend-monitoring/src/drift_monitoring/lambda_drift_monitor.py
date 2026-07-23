@@ -489,8 +489,12 @@ def check_data_drift():
                 'threshold': info.get('threshold', 0),
             })
 
-    # Sort by drift score ascending (lower p-value = more drifted)
-    drifted_features.sort(key=lambda x: x['drift_score'])
+    # Sort by drift_magnitude descending (higher = more drifted). Magnitude is
+    # test-agnostic and bounded because evidently_reports forces the
+    # jensenshannon distance metric for every column, so this ranks features by
+    # drift severity rather than by raw p-value precision (see the
+    # evidently_reports module docstring for why the metric is pinned).
+    drifted_features.sort(key=lambda x: x['drift_magnitude'], reverse=True)
 
     features_analyzed = len(per_column)
     drifted_count = drift_result['drifted_columns_count']

@@ -476,8 +476,8 @@ QuickSight dashboard with three sheets and **32 visuals** — each visual answer
 - **Max feature drift magnitude per run** — the *worst* feature per run, colored by model version. Moderate averages (Tab 2's D1) can hide one catastrophically-drifted feature; this visual makes the peak visible.
 - **Repeat-offender features** — count of runs each feature has been flagged in. Chronic drifters → retraining candidates. One-off spikes → data-quality issues.
 - **Cross-model heatmap** — feature × `model_version` pivot. "Is this feature drifting consistently across our retrained models, or was it a training-artifact of one specific version?"
-- **Raw `drift_score` — p-value tests** (KS / Chi-square, filtered to `drift_method` containing `p_value`): LOWER = more drift, reference line at 0.05. For auditing the underlying test statistic on features where Evidently chose a p-value test.
-- **Raw `drift_score` — distance tests** (Wasserstein / Jensen-Shannon / PSI, filtered to `drift_method` containing `distance`): HIGHER = more drift, reference line at 0.1. The distance-test counterpart — kept separate because raw scores from the two test families are not comparable.
+- **Raw `drift_score` — p-value tests** (KS / Chi-square, filtered to `drift_method` containing `p_value`): LOWER = more drift, reference line at 0.05. Since every column is scored with Jensen-Shannon distance, no feature uses a p-value test and **this panel is expected to be empty** — it exists only for when you switch `DRIFT_NUM_METHOD` / `DRIFT_CAT_METHOD` to a p-value test.
+- **Raw `drift_score` — distance tests** (Wasserstein / Jensen-Shannon / PSI, filtered to `drift_method` containing `distance`): HIGHER = more drift, reference line at 0.1. This is where every feature lands, since all columns are scored with Jensen-Shannon distance.
 - **Per-feature detail table** — every run × feature showing both raw `drift_score` AND normalized `drift_magnitude` alongside `drift_method` and severity, so you can see the raw statistic and the test-agnostic number side by side.
 
 **How the tabs work together:**
@@ -696,14 +696,17 @@ This project's **custom inference handler + SQS + Lambda** approach solves all t
 
 ### Statistical tests
 
-Drift detection uses Evidently's `DataDriftPreset`, which auto-selects a test **per column** based on column type and sample size — you don't pin one test globally. Common picks in this deployment:
+Drift detection uses Evidently's `DataDriftPreset`, but this solution **pins a single statistical test for every column** instead of relying on Evidently's default behavior. By default `DataDriftPreset` auto-selects a test **per column** based on column type and sample size (Kolmogorov–Smirnov / Chi-square p-value tests for small samples, distance/divergence tests like Wasserstein or Jensen-Shannon for large ones). That auto-pick is convenient but causes two real problems for a governance dashboard:
 
-- **Numerical features, small sample (< 1000 rows):** Kolmogorov–Smirnov p-value — flagged if p < 0.05. Sensitive to tail changes.
-- **Numerical features, large sample:** Wasserstein distance — flagged if distance > 0.1. More robust than KS at scale.
-- **Categorical features:** Chi-square p-value — flagged if p < 0.05.
-- **Population Stability Index (PSI):** Evidently reports PSI in the metadata but doesn't use it as the primary per-column flag anymore. The `data_drift_threshold` in `config.yaml` (default 0.2) is applied at the *aggregate* level (`drifted_columns_share`) to decide whether the overall drift verdict is "detected", not per-column.
+1. **Drift direction flips between features.** p-value tests flag drift when the score is *below* the threshold (lower = more drift); distance tests flag when the score is *above* it (higher = more drift). Mixing both in one run means the raw `drift_score` column has no single "higher = worse" reading, so it can't be sorted or aggregated across features.
+2. **Magnitude is unbounded for p-value tests.** For a p-value test, `drift_magnitude = threshold / p_value`, which explodes as the p-value approaches zero. At the 5k–10k sample sizes the daily Lambda pulls, the KS test is hypersensitive — a trivial distribution difference yields a near-zero p-value and a huge magnitude. A feature that merely draws the smallest p-value would then rank as the most drifted, turning p-value *precision* into apparent drift *severity*.
 
-Evidently exposes each column's chosen test in the report metadata; `evidently_reports.py` records both the raw `drift_score` (whatever the chosen test outputs — a p-value for tests, a distance for divergence metrics) and a normalized `drift_magnitude` field that means "how far past the threshold, ×1.0 = at threshold, higher = more drifted" regardless of which test was used. Dashboards sort/compare by magnitude to stay test-agnostic.
+**How this solution handles it (in `src/drift_monitoring/evidently_reports.py`):** it forces one bounded distance metric — **Jensen-Shannon distance** (range `[0, 1]`, higher = more drift) — for both numeric and categorical columns via `DataDriftPreset(num_method=..., cat_method=..., num_threshold=..., cat_threshold=...)`. This makes test selection deterministic (independent of sample size), gives every feature the same drift direction, and bounds `drift_magnitude` (`score / threshold`, with threshold `0.1` → magnitude in `[0, 10]`) so it is comparable across features. The method and threshold are module-level constants (`DRIFT_NUM_METHOD` / `DRIFT_CAT_METHOD` / `DRIFT_THRESHOLD`) — change them there to use a different metric.
+
+- **Numeric + categorical features:** Jensen-Shannon distance — flagged if distance > `0.1`. Bounded, symmetric, and stable regardless of sample size.
+- **Population Stability Index (PSI):** available as an alternative `num_method`/`cat_method` value if you prefer PSI semantics. The `data_drift_threshold` in `config.yaml` (default 0.2) is applied at the *aggregate* level (`drifted_columns_share`) to decide whether the overall drift verdict is "detected", not per-column.
+
+`evidently_reports.py` records both the raw `drift_score` (the Jensen-Shannon distance) and a normalized `drift_magnitude` field ("how far past the threshold, ×1.0 = at threshold, higher = more drifted"). Because the test is uniform across columns the two move in the same direction; dashboards sort and compare by `drift_magnitude` so a single normalized number ranks every feature.
 
 ### Thresholds (configurable in `src/config/config.yaml`)
 
@@ -723,7 +726,7 @@ Evidently exposes each column's chosen test in the report metadata; `evidently_r
 | 0.03 – 0.05             | Monitor |
 | > 0.05 (default)        | **Alert triggered** |
 
-The **per-column** drift flag uses Evidently's own test-specific thresholds (KS p-value < 0.05, Wasserstein > 0.1, etc.) — these are exposed in the report metadata but not directly configurable via `config.yaml`. Change them by passing an explicit stat-test config to `DataDriftPreset` in `src/drift_monitoring/evidently_reports.py` if you need to override.
+The **per-column** drift flag uses the forced Jensen-Shannon distance with a fixed threshold of `0.1` (`DRIFT_THRESHOLD` in `src/drift_monitoring/evidently_reports.py`). This is intentionally pinned in code rather than exposed via `config.yaml` — the whole point of forcing one metric is that the per-column test and threshold stay deterministic across runs and sample sizes. To use a different metric or threshold, edit `DRIFT_NUM_METHOD` / `DRIFT_CAT_METHOD` / `DRIFT_THRESHOLD` and redeploy the drift Lambda.
 
 ### Reports
 
@@ -758,7 +761,7 @@ Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and 
 
 ![Top drifted features by magnitude](docs/screenshots/quicksight/narrative/feat_top15_drifted.png)
 
-> **Why `drift_magnitude` and not raw `drift_score`?** Evidently picks a different test per column (KS p-value for some, Wasserstein distance for others), and those raw scores move in opposite directions and live on incomparable scales. Ranking on raw score is meaningless across a mixed set of tests — see [drift_score vs drift_magnitude](#drift_score-vs-drift_magnitude--the-two-fields-and-which-one-to-trust). (An earlier version of these screenshots plotted raw `drift_score` and was dominated by a single mis-scaled feature reading ~1000; those misleading images have been removed in favor of the magnitude-based views here.)
+> **Why `drift_magnitude` and not raw `drift_score`?** Left to its defaults, Evidently would pick a different test per column (KS p-value for some, Wasserstein distance for others), and those raw scores move in opposite directions on incomparable scales — ranking on raw score is meaningless, and a single feature with a near-zero p-value can dominate the chart at an inflated magnitude. This solution [forces a single Jensen-Shannon distance metric for every column](#statistical-tests), so the raw scores are comparable; the dashboards rank on `drift_magnitude` because it normalizes to "× past threshold" and gives one number that reads the same for every feature. See [Reading drift scores in the dashboards](#reading-drift-scores-in-the-dashboards).
 
 **4. Does the drift actually matter? Cross-reference SHAP.** Drift magnitude tells you *what changed*; SHAP (from [`7_optional_shap_explainability.ipynb`](notebooks/7_optional_shap_explainability.ipynb)) tells you *what the model relies on*. The intersection is what you act on. Two complementary SHAP views are worth looking at side by side:
 
@@ -957,7 +960,7 @@ If your target column isn't binary, replace `simulate_ground_truth_from_athena.p
 - `MIN_SAMPLES` — minimum labeled rows within the model-drift window before ROC-AUC is computed (fallback `100`). Below this the run records NULL performance metrics.
 - `KS_PVALUE_THRESHOLD` (fallback `0.05`) and `BASELINE_ROC_AUC` (fallback `0.92`, only used when no registered `baseline.json` is found).
 
-> Evidently auto-selects the per-feature statistical test by sample size (p-value tests like KS/Chi-square on small samples, distance tests like Wasserstein/Jensen-Shannon on large ones); this project does not expose a single "pick the test" config key.
+> Note: `KS_PVALUE_THRESHOLD` above is a legacy env var — the per-feature drift test is no longer a sample-size-dependent p-value test. This solution [pins Jensen-Shannon distance for every column](#statistical-tests) (`DRIFT_NUM_METHOD` / `DRIFT_CAT_METHOD` / `DRIFT_THRESHOLD` in `src/drift_monitoring/evidently_reports.py`) so drift scoring is deterministic and comparable across features; change the metric there and redeploy the Lambda.
 
 `config.yaml` value changes are picked up on the next notebook/CLI run with no redeploy. **Lambda env-var changes require a redeploy** (`python main.py monitoring deploy-lambda`) — or, to retune the two alert *thresholds* on a live Lambda without a full rebuild:
 

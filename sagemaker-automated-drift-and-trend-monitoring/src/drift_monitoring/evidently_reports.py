@@ -3,6 +3,35 @@ Evidently-based drift detection and model performance reporting.
 
 Replaces custom matplotlib visualizations with Evidently's built-in
 interactive HTML reports for data drift and classification metrics.
+
+Drift test selection
+---------------------
+We pin ONE statistical test for every column rather than letting Evidently
+auto-select per column. By default Evidently chooses the test based on sample
+size and column type: small samples get p-value tests (Kolmogorov-Smirnov,
+Chi-square) while large samples get distance/divergence tests (Wasserstein,
+PSI, Jensen-Shannon). That per-column auto-selection breaks a governance
+dashboard in two ways:
+
+  1. Drift direction is not uniform. p-value tests flag drift when score <
+     threshold (lower = more drift); distance tests flag when score >
+     threshold (higher = more drift). Mixing both in one run means the raw
+     `drift_score` column has no single "higher = worse" reading, so it can't
+     be sorted or aggregated across features.
+  2. Magnitude is unbounded for p-value tests. `drift_magnitude` for a p-value
+     test is `threshold / p_value`, which explodes as the p-value approaches
+     zero — and at the 5k–10k sample sizes this Lambda pulls, the KS test is
+     hypersensitive, so a trivial distribution difference yields a near-zero
+     p-value and a huge magnitude. A feature that merely drew the smallest
+     p-value would rank as the most drifted, turning p-value precision into
+     apparent drift severity.
+
+So we force a single bounded distance metric for every column: the test is
+deterministic (not sample-size-dependent), drift direction is uniform
+(higher = more drift for all features), and magnitude is bounded and
+comparable across features. We use Jensen-Shannon distance (range [0, 1])
+for both numeric and categorical columns. See DRIFT_NUM_METHOD /
+DRIFT_CAT_METHOD below and `run_data_drift_report`.
 """
 
 import logging
@@ -17,6 +46,19 @@ from evidently.metrics import DriftedColumnsCount, ValueDrift
 from evidently.presets import ClassificationPreset, DataDriftPreset
 
 logger = logging.getLogger(__name__)
+
+# Forced drift test — see module docstring. Jensen-Shannon is a bounded
+# distance metric ([0, 1], higher = more drift) applied uniformly to every
+# column so test choice never depends on sample size. Both numeric and
+# categorical columns use it so drift_magnitude is comparable across all
+# features. `DRIFT_THRESHOLD` is the JS distance above which a column is
+# flagged as drifted (Evidently's documented default for jensenshannon is
+# 0.1); `drift_magnitude` = score / threshold, so 1.0 = at threshold.
+DRIFT_NUM_METHOD = "jensenshannon"
+DRIFT_CAT_METHOD = "jensenshannon"
+DRIFT_THRESHOLD = 0.1
+# Share of columns that must drift before the dataset is flagged overall.
+DRIFT_SHARE_THRESHOLD = 0.5
 
 
 def run_data_drift_report(
@@ -40,7 +82,18 @@ def run_data_drift_report(
             - 'drifted_columns_share': share of drifted columns
             - 'per_column': dict mapping column name -> {'drift_score': float, 'drifted': bool}
     """
-    report = Report(metrics=[DataDriftPreset()])
+    # Force a single bounded distance metric for every column instead of
+    # letting Evidently auto-pick per column by sample size (see the module
+    # docstring for why the auto-pick breaks cross-feature ranking).
+    # num_method/cat_method pin the test; the matching thresholds make
+    # `drift_magnitude = score / threshold` comparable across all features.
+    report = Report(metrics=[DataDriftPreset(
+        num_method=DRIFT_NUM_METHOD,
+        cat_method=DRIFT_CAT_METHOD,
+        num_threshold=DRIFT_THRESHOLD,
+        cat_threshold=DRIFT_THRESHOLD,
+        drift_share=DRIFT_SHARE_THRESHOLD,
+    )])
     snapshot = report.run(reference_data=baseline_df, current_data=current_df)
 
     if output_path:
@@ -79,8 +132,11 @@ def run_data_drift_report(
             method = config.get("method", "")
             drift_score = float(value) if value is not None else 1.0
 
-            # Evidently picks the test per-column based on sample size and
-            # column type. The comparison direction depends on which test:
+            # We force a distance metric (jensenshannon) for every column via
+            # DataDriftPreset above, so drift is uniformly "score > threshold"
+            # (higher = more drift). The `is_p_value` handling below keeps the
+            # drift direction correct for any test family, so a different
+            # DRIFT_NUM_METHOD / DRIFT_CAT_METHOD still reads correctly:
             #   * p-value tests (KS, Chi-Square)   → drift when score < threshold
             #   * distance / divergence tests      → drift when score > threshold
             #     (Wasserstein, PSI, Jensen-Shannon, Hellinger, TVD, ...)
@@ -92,7 +148,12 @@ def run_data_drift_report(
             # drift_magnitude is a test-agnostic "how far past the threshold":
             #   1.0 = at threshold, >1.0 = drifted, higher = more drifted
             # Callers can sort by this descending to get "top N drifted" without
-            # caring which test was used for which column.
+            # caring which test was used for which column. With the forced
+            # jensenshannon metric this is bounded (score in [0, 1], threshold
+            # 0.1 → magnitude in [0, 10]). The p-value branch uses the inverse
+            # ratio only so a p-value-based DRIFT_*_METHOD stays directionally
+            # correct; it is intentionally not the configured default because it
+            # is unbounded (see the module docstring).
             if is_p_value:
                 # p-values: smaller = more drifted → invert ratio
                 drift_magnitude = (threshold / drift_score) if drift_score > 0 else float("inf")
