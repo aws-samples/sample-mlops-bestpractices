@@ -484,6 +484,9 @@ def check_data_drift():
             drifted_features.append({
                 'feature': col,
                 'drift_score': info.get('drift_score', 0),
+                'drift_magnitude': info.get('drift_magnitude', 0),
+                'method': info.get('method', ''),
+                'threshold': info.get('threshold', 0),
             })
 
     # Sort by drift score ascending (lower p-value = more drifted)
@@ -1030,11 +1033,19 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     now = datetime.now()
     run_id = f"drift-{now.strftime('%Y%m%d-%H%M%S')}"
 
-    # Build per-feature drift scores JSON
+    # Build per-feature drift scores JSON. Nested per-feature object so the
+    # governance dashboard can plot the test-agnostic magnitude alongside the
+    # raw score. The feature_drift_detail Athena view parses this shape
+    # (MAP(VARCHAR, JSON)); legacy flat rows still read via its TRY_CAST path.
     per_feature = {}
     if data_drift_result:
         for feat_info in data_drift_result.get('drifted_features', []):
-            per_feature[feat_info['feature']] = feat_info.get('drift_score', 0)
+            per_feature[feat_info['feature']] = {
+                'score': feat_info.get('drift_score', 0),
+                'magnitude': feat_info.get('drift_magnitude', 0),
+                'method': feat_info.get('method', ''),
+                'threshold': feat_info.get('threshold', 0),
+            }
 
     # Compute F1 from precision and recall if model drift available
     f1 = None
