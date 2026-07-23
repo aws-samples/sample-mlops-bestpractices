@@ -197,9 +197,11 @@ def run_classification_report(
 
     Args:
         baseline_df: Reference data with target and prediction columns. Must
-            contain BOTH class labels (0 and 1).
+            contain BOTH class labels (0 and 1). The target/prediction columns
+            may be any numeric dtype (int, nullable Int64, float) — they are
+            normalized to int internally so the caller need not cast them.
         current_df: Current data with target and prediction columns. Must
-            also contain BOTH class labels.
+            also contain BOTH class labels. Same dtype handling as baseline_df.
         target_column: Name of the ground-truth label column.
         prediction_column: Name of the predicted label column.
         output_path: If provided, saves the HTML report to this path.
@@ -213,6 +215,29 @@ def run_classification_report(
         ValueError: If either dataframe lacks both class labels (caught
             early before Evidently crashes with a confusing KeyError).
     """
+    # Normalize label dtypes FIRST — this must happen before the class check
+    # and before building the Evidently Datasets. Evidently's
+    # `ClassificationQualityByClass` builds its class set from
+    # `str(k) for k in y_true.unique()` and then looks those keys up in
+    # sklearn's `classification_report` dict. If `target` and `prediction`
+    # arrive with different dtypes (e.g. one column is numpy int64 → labels
+    # "0"/"1", while the other is pandas nullable Int64 or float64 → labels
+    # "0.0"/"1.0"), the string keys don't match and Evidently raises a bare
+    # `KeyError: '0'`. This happens whenever a caller mixes a hand-built
+    # DataFrame (dtype int) with one read from Athena via awswrangler (which
+    # returns INTEGER columns as nullable Int64/float). Casting both columns
+    # in both frames to plain Python-int labels removes the mismatch. We copy
+    # so the caller's DataFrames are left untouched.
+    label_cols = (target_column, prediction_column)
+    baseline_df = baseline_df.dropna(subset=list(label_cols)).copy()
+    current_df = current_df.dropna(subset=list(label_cols)).copy()
+    for df in (baseline_df, current_df):
+        for col in label_cols:
+            # round() guards against float labels like 0.9999; .astype(int)
+            # then yields consistent "0"/"1" string keys for every caller.
+            # (NaNs were dropped above so the int cast can't raise.)
+            df[col] = df[col].astype(float).round().astype(int)
+
     # Pre-flight check — Evidently's KeyError is unhelpful; fail loudly here.
     # Both `target` AND `prediction` columns must contain BOTH classes (0 AND 1)
     # in BOTH datasets. Evidently's `ClassificationQualityByClass` internally
