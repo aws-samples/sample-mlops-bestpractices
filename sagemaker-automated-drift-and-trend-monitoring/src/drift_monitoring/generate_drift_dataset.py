@@ -198,8 +198,14 @@ def generate_drifted_dataset():
         if feature in df_drifted.columns and feature in df_original.columns:
             original_mean = df_original[feature].mean()
             drifted_mean = df_drifted[feature].mean()
-            pct_change = ((drifted_mean - original_mean) / original_mean) * 100
-            print(f"{feature:30s} Original: {original_mean:10.2f}  Drifted: {drifted_mean:10.2f}  Change: {pct_change:+6.1f}%")
+            # Guard against a near-zero baseline: normalized/scaled features
+            # (mean≈0) make a relative % change blow up to ~1e16, which is
+            # meaningless. Show the absolute delta instead in that case.
+            if abs(original_mean) < 1e-9:
+                change_str = f"{drifted_mean - original_mean:+.4f} (abs; baseline≈0)"
+            else:
+                change_str = f"{((drifted_mean - original_mean) / original_mean) * 100:+6.1f}%"
+            print(f"{feature:30s} Original: {original_mean:10.2f}  Drifted: {drifted_mean:10.2f}  Change: {change_str}")
 
     print("\n" + "=" * 80)
     print("DRIFTED DATASET GENERATION COMPLETED")

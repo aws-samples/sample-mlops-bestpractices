@@ -202,6 +202,70 @@ data:
   s3_drifted_data: ""
 
 # ---------------------------------------------------------------------------
+# Training-data download (source dataset -> project schema)
+# ---------------------------------------------------------------------------
+# Used only by src/setup/download_kaggle_dataset.py. That script downloads a
+# public Kaggle dataset, renames its raw columns to this project's schema,
+# adds a couple of demo columns, and writes the CSV the pipeline seeds from.
+#
+# To bring your OWN data you have two options:
+#   1. Same shape, different Kaggle dataset -> just change the values below.
+#   2. A non-Kaggle source -> replace the loader script (see the BYO steps at
+#      the top of dataset_schema.yaml). The output column names on the right
+#      side of `kaggle_column_map` MUST match the columns declared there.
+data_download:
+  # Kaggle dataset slug (owner/name) and the CSV file inside its archive.
+  kaggle_dataset: "mlg-ulb/creditcardfraud"
+  kaggle_csv_filename: "creditcard.csv"
+  # Seed for the synthetic columns below so every download is reproducible
+  # (same input -> byte-identical output CSV).
+  random_state: 42
+  # The raw Kaggle file uses anonymized names (Time, V1..V28, Amount, Class).
+  # This maps each raw name -> the business-friendly column this project uses.
+  # The values (numbers) are unchanged; only the header names are swapped.
+  # Every name on the RIGHT must exist in dataset_schema.yaml.
+  kaggle_column_map:
+    Time: transaction_timestamp
+    V1: transaction_hour
+    V2: transaction_day_of_week
+    V3: customer_age
+    V4: account_age_days
+    V5: merchant_category_code
+    V6: distance_from_home_km
+    V7: distance_from_last_transaction_km
+    V8: online_transaction
+    V9: chip_transaction
+    V10: pin_used
+    V11: recurring_transaction
+    V12: international_transaction
+    V13: high_risk_country
+    V14: num_transactions_24h
+    V15: num_transactions_7days
+    V16: avg_transaction_amount_30days
+    V17: max_transaction_amount_30days
+    V18: card_present
+    V19: address_verification_match
+    V20: cvv_match
+    V21: velocity_score
+    V22: merchant_reputation_score
+    V23: time_since_last_transaction_min
+    V24: transaction_type_code
+    V25: customer_tenure_months
+    V26: credit_limit
+    V27: available_credit_ratio
+    V28: previous_fraud_incidents
+    Amount: transaction_amount
+    Class: is_fraud
+  # customer_gender is NOT in the raw Kaggle data. It is synthesized here so
+  # the schema has one categorical (string) feature to demonstrate. Set which
+  # column receives it, the allowed categories, and how often each is drawn.
+  # `synthetic_gender_weights` must have the same length as the categories and
+  # sum to 1.0. This column must also be declared in dataset_schema.yaml.
+  synthetic_gender_column: customer_gender
+  synthetic_gender_categories: ["Male", "Female", "Other"]
+  synthetic_gender_weights: [0.45, 0.45, 0.10]
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 # Target column, feature list, and column-rename map live in code, not here —
@@ -212,7 +276,6 @@ data:
 # Only XGBoost hyperparameters live in this section because they're tunable
 # without re-deriving the dataset.
 training:
-  random_state: 42
   # XGBoost hyperparameters tuned for severe class imbalance (~580:1 in the
   # Kaggle credit-card fraud dataset). Shallow trees + larger min_child_weight
   # + early stopping prevent the model from memorizing the small positive class
@@ -282,34 +345,58 @@ drift_monitor:
 # Drift dataset generation (for testing the monitoring pipeline)
 # ---------------------------------------------------------------------------
 # Used by src/drift_monitoring/generate_drift_dataset.py to fabricate a
-# drifted CSV that exercises the drift detector. One scenario only —
-# easier to explain in monitoring outputs.
+# "drifted" copy of the data so you can watch the drift detector light up.
 #
-# Drift types:
-#   multiplicative: new_value = original × (factor ± noise × factor)
-#   additive:       new_value = original + (shift ± noise)
+# There are two ways to drift a feature:
+#
+#   multiplicative — scale each value up/down.
+#       new_value = old_value × factor
+#       factor 1.1 = "make it 10% bigger". Good for values on a real scale
+#       that are always positive (e.g. dollars). Bad for values centered on
+#       zero, because anything × factor is still ~0 → no visible change.
+#
+#   additive — add a fixed amount to each value.
+#       new_value = old_value + shift
+#       shift 0.5 = "move every value up by 0.5". Works no matter what the
+#       starting values are, so the change is predictable and easy to explain.
+#
+# `noise` just adds a little randomness so every row isn't shifted by the
+# exact same amount (makes the fake data look more realistic). Bigger noise
+# = more spread. It does not change the average much.
 drift_generation:
-  num_samples: 5000
-  random_state: 123
+  num_samples: 5000        # how many rows of drifted data to generate
+  random_state: 123        # fixed seed → same drifted data every run (reproducible)
 
-  # Drift applied to 5 key features
+  # Each feature below gets drifted using the type/amount you specify.
+  # Rule of thumb: raise the factor/shift → the feature drifts more →
+  # the drift detector reacts more strongly. That is the whole point of
+  # this section: these numbers directly control how much drift appears.
   default_drift:
+    # Dollars — always positive, on a real scale. ×1.1 = 10% higher spend.
     transaction_amount:
       type: "multiplicative"
       factor: 1.1
       noise: 0.05
+    # A timestamp (large integer). Add 10000 to shift everything later in time.
     transaction_timestamp:
       type: "additive"
       shift: 10000
       noise: 1000
+    # This feature is "standardized" — its values are centered on zero (some
+    # negative, some positive, average ≈ 0). Multiplying by a factor would do
+    # almost nothing (anything × factor is still ≈ 0), so we ADD instead.
+    # shift 0.5 = push the average from ~0 up to ~0.5. Predictable.
     distance_from_home_km:
-      type: "multiplicative"
-      factor: 1.2
+      type: "additive"
+      shift: 0.5
       noise: 0.1
+    # Also centered on zero — same reason, add instead of multiply.
+    # shift 0.3 = push the average from ~0 up to ~0.3.
     velocity_score:
-      type: "multiplicative"
-      factor: 1.15
+      type: "additive"
+      shift: 0.3
       noise: 0.1
+    # A count (whole number) centered near zero. Add 1 to bump the average up.
     num_transactions_24h:
       type: "additive"
       shift: 1
@@ -320,13 +407,3 @@ drift_generation:
 # (QUICKSIGHT_*). They are NOT duplicated in this YAML because they should
 # be stable across environments — changing them would orphan existing
 # datasets/dashboards.
-
-# ---------------------------------------------------------------------------
-# SHAP explainability
-# ---------------------------------------------------------------------------
-shap:
-  background_samples: 500
-  max_display_features: 20
-  check_additivity: false
-  random_state: 42
-  output_dir: "shap_output/"

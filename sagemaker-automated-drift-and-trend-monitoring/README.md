@@ -343,24 +343,24 @@ Configuration values differ between notebook testing, Lambda code defaults, and 
 
 | Variable | Notebook 3 | Lambda Code Default<br/>(if not deployed) | Deployed via Script<br/>(`deploy_lambda_container.sh`) | Where to Change |
 |----------|------------|-------------------------------------------|--------------------------------------------------------|-----------------|
-| `MIN_SAMPLES` | **50** | **100** | **100** (inherits code default) | Notebook: line 1027<br/>Lambda: env var or code line 61 |
-| `DATA_DRIFT_LOOKBACK_DAYS` | incremental* | **7 days** | **1 day** ⚠️ | **Script line 315**<br/>Or pass as Lambda env var |
-| `MODEL_DRIFT_LOOKBACK_DAYS` | **30 days** | **30 days** | **1 day** ⚠️ | **Script line 316**<br/>Or pass as Lambda env var |
-| `DATA_DRIFT_THRESHOLD` | **0.20** (20%) | **0.2** | **0.2** (script arg 2) | Script argument<br/>`config.yaml` drift_thresholds.data_drift<br/>Lambda env var |
-| `MODEL_DRIFT_THRESHOLD` | **0.05** (5%) | **0.05** | **0.05** (script arg 3) | Script argument<br/>`config.yaml` drift_thresholds.model_drift<br/>Lambda env var |
-| `KS_PVALUE_THRESHOLD` | (not set) | **0.05** | **0.05** (inherits code default) | Lambda env var or code line 59 |
+| `MIN_SAMPLES` | **50** | **100** | **100** (inherits code default) | Lambda env var in `deploy_lambda_container.sh` (else `MIN_SAMPLES` code fallback) |
+| `DATA_DRIFT_LOOKBACK_DAYS` | incremental* | **7 days** | **1 day** ⚠️ | `DATA_DRIFT_LOOKBACK_DAYS` env var in `deploy_lambda_container.sh` |
+| `MODEL_DRIFT_LOOKBACK_DAYS` | **30 days** | **30 days** | **1 day** ⚠️ | `MODEL_DRIFT_LOOKBACK_DAYS` env var in `deploy_lambda_container.sh` |
+| `DATA_DRIFT_THRESHOLD` | **0.20** (20%) | **0.2** | **0.2** | `config.yaml` `drift_thresholds.data_drift`, or Lambda env var |
+| `MODEL_DRIFT_THRESHOLD` | **0.05** (5%) | **0.05** | **0.05** | `config.yaml` `drift_thresholds.model_drift`, or Lambda env var |
+| `KS_PVALUE_THRESHOLD` | (not set) | **0.05** | **0.05** (inherits code default) | `KS_PVALUE_THRESHOLD` env var in `deploy_lambda_container.sh` |
 
 **\*Notebook incremental mode:** Notebook 3 queries `MAX(monitoring_timestamp)` from the last drift run and only analyzes predictions since that timestamp. This avoids re-analyzing the same data on each notebook re-run. The Lambda uses fixed rolling windows instead.
 
-**⚠️ Critical:** The deployment script **hardcodes 1-day lookback windows** (lines 315-316), overriding the Lambda code defaults of 7/30 days. This means:
+**⚠️ Critical:** The deployment script **hardcodes 1-day lookback windows** (the `DATA_DRIFT_LOOKBACK_DAYS` / `MODEL_DRIFT_LOOKBACK_DAYS` env vars it sets), overriding the Lambda code defaults of 7/30 days. This means:
 - **As deployed**: Lambda analyzes last 1 day of predictions for both data and model drift
 - **Lambda code says**: 7 days for data drift, 30 days for model drift (ignored when deployed via script)
 - **Why 1 day?** Designed for daily scheduled runs where you want to detect drift in yesterday's predictions, not a rolling multi-day window
 
 **To use longer lookback windows in production:**
-1. Edit `scripts/deploy_lambda_container.sh` lines 315-316 to desired values (e.g., `"7"` and `"30"`)
+1. In `scripts/deploy_lambda_container.sh`, set the `DATA_DRIFT_LOOKBACK_DAYS` / `MODEL_DRIFT_LOOKBACK_DAYS` env vars to your desired values (e.g., `"7"` and `"30"`)
 2. Redeploy: `cd scripts && ./deploy_lambda_container.sh your-email@example.com`
-3. Or update Lambda environment variables directly via AWS console / CLI after deployment
+3. Or update the Lambda's environment variables directly via AWS console / CLI after deployment
 
 **When to use each:**
 - **1 day (deployed default)**: Daily monitoring of yesterday's predictions, fast alerts for sudden drift
@@ -375,7 +375,7 @@ For high-volume real-time applications, you may want drift detection to run ever
 
 **Step-by-step conversion:**
 
-1. **Update deployment script** (`scripts/deploy_lambda_container.sh` lines 315-316):
+1. **Update the deployment script** — in `scripts/deploy_lambda_container.sh`, swap the day-based lookback env vars for minute-based ones:
    
    Replace:
    ```bash
@@ -389,7 +389,7 @@ For high-volume real-time applications, you may want drift detection to run ever
    "MODEL_DRIFT_LOOKBACK_MINUTES": "120",
    ```
 
-2. **Update Lambda code** (`src/drift_monitoring/lambda_drift_monitor.py` lines 64-65):
+2. **Update the Lambda constants** — in `src/drift_monitoring/lambda_drift_monitor.py`, replace the two module-level `*_LOOKBACK_DAYS` constants:
    
    Replace:
    ```python
@@ -403,48 +403,27 @@ For high-volume real-time applications, you may want drift detection to run ever
    MODEL_DRIFT_LOOKBACK_MINUTES = int(os.getenv('MODEL_DRIFT_LOOKBACK_MINUTES', '120'))
    ```
 
-3. **Update drift functions** (same file):
-   
-   In `check_data_drift()` function (around line 431), replace:
+3. **Update the drift functions** (same file) — in `check_data_drift()`, change the `lookback_start` computation from days to minutes:
    ```python
    lookback_start = (datetime.now() - timedelta(days=DATA_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
-   ```
-   
-   With:
-   ```python
+   # →
    lookback_start = (datetime.now() - timedelta(minutes=DATA_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
    ```
    
-   In `check_model_drift()` function (around line 526), replace:
+   And the same edit in `check_model_drift()`:
    ```python
    lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
-   ```
-   
-   With:
-   ```python
+   # →
    lookback_start = (datetime.now() - timedelta(minutes=MODEL_DRIFT_LOOKBACK_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
    ```
 
-4. **Update EventBridge schedule** (in `scripts/deploy_lambda_container.sh` line 64 or `src/config/config.yaml`):
-   
-   In deployment script, the schedule is read from config. Update `config.yaml`:
+4. **Update the EventBridge schedule** — set `drift_monitor.schedule` in `src/config/config.yaml` (the deploy script reads it via the `DRIFT_MONITOR_SCHEDULE` config key):
    ```yaml
    drift_monitor:
      schedule: "rate(15 minutes)"  # Was: "cron(0 2 * * ? *)"
    ```
 
-5. **Optional: Update notebook constants** (`src/config/config.py`):
-   
-   For consistency with notebook 3, rename:
-   ```python
-   # Old:
-   MONITORING_DATA_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('data_drift_lookback_days', 7)
-   MONITORING_MODEL_DRIFT_LOOKBACK_DAYS = config_yaml.get('monitoring', {}).get('model_drift_lookback_days', 30)
-   
-   # New:
-   MONITORING_DATA_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('data_drift_lookback_minutes', 60)
-   MONITORING_MODEL_DRIFT_LOOKBACK_MINUTES = config_yaml.get('monitoring', {}).get('model_drift_lookback_minutes', 120)
-   ```
+5. **Optional: rename the notebook constants** — in `src/config/config.py`, the `MONITORING_DATA_DRIFT_LOOKBACK_DAYS` / `MONITORING_MODEL_DRIFT_LOOKBACK_DAYS` constants keep notebook 3 aligned with the Lambda. Rename them to their `*_MINUTES` equivalents (and the matching `config.yaml` keys they read) so interactive testing uses the same window.
 
 6. **Redeploy:**
    ```bash
@@ -769,7 +748,7 @@ The three QuickSight sheets are designed to be read in order — **model → dat
 
 Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and F1 all sit at 0** (they overlap into a single line along the x-axis). If the dashboard reported only accuracy, an on-call engineer would have concluded "0.85 — nothing wrong here" and moved on. The ROC-AUC + precision + recall + F1 lines together reveal the truth: the model has silently **collapsed to predicting the majority class (`non-fraud`) on every transaction**. It looks accurate because ~99.8% of real credit-card transactions genuinely are non-fraud in the Kaggle dataset — but *zero actual fraud is being caught*.
 
-> **Why does this happen, and is it an artifact of the ground-truth simulator?** No — the simulator's flip logic is symmetric (`~df.loc[error_indices, 'actual_fraud']` in `simulate_ground_truth_from_athena.py:170` flips both directions). The collapse to `precision = recall = 0` comes from the model side: under drifted inputs, XGBoost's fraud probability drops below the `0.5` decision threshold on essentially every row (ROC-AUC ~0.48 confirms near-random behavior on the score), so **every prediction is `0`**. Once every prediction is a single class, `TP = FP = 0` — and precision (TP/(TP+FP)) and recall (TP/(TP+FN)) are both structurally zero regardless of what the ground-truth side does. Accuracy stays high because the ground truth is mostly `0` too, and matching `0 → 0` counts as correct. **This is the class of failure that dashboards must catch and single-metric monitoring will miss** — the drift alert in this solution therefore fires on `roc_auc_degradation`, not on accuracy.
+> **Why does this happen, and is it an artifact of the ground-truth simulator?** No — the simulator's flip logic is symmetric (the label-flip in `simulate_ground_truth_from_athena.py` negates `actual_fraud`, flipping both directions). The collapse to `precision = recall = 0` comes from the model side: under drifted inputs, XGBoost's fraud probability drops below the `0.5` decision threshold on essentially every row (ROC-AUC ~0.48 confirms near-random behavior on the score), so **every prediction is `0`**. Once every prediction is a single class, `TP = FP = 0` — and precision (TP/(TP+FP)) and recall (TP/(TP+FN)) are both structurally zero regardless of what the ground-truth side does. Accuracy stays high because the ground truth is mostly `0` too, and matching `0 → 0` counts as correct. **This is the class of failure that dashboards must catch and single-metric monitoring will miss** — the drift alert in this solution therefore fires on `roc_auc_degradation`, not on accuracy.
 
 **2. The inputs shifted — the "why".** The data-drift sheet shows **~93% of features drifted** (share ≈ 0.9–1.0, ~28 of 30 columns) with alerts firing. Widespread input drift is exactly what you'd expect to precede a performance collapse.
 
@@ -806,7 +785,7 @@ Accuracy sits flat at **~0.85** the entire time, while **precision, recall, and 
 >
 > QuickSight only visualizes Evidently's distance / p-value statistics between the baseline and current distributions. It has no access to the trained model and no notion of feature importance. The reason `num_transactions_24h` ranks worst in the drift chart *and* ranks #2 in SHAP is a **property of this demo, not an emergent discovery**:
 >
-> - The `drift_generation.default_drift` block in `src/config/config.yaml` (lines ~295-316) is what determines the shape and magnitude of drift injected into the demo dataset. The author picked five features to drift and tuned the shift/factor per feature. `num_transactions_24h` gets an additive `shift: 1` — and because that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`, renamed for readability — see `src/setup/download_kaggle_dataset.py:71`), a +1 shift moves the distribution by ~1σ. Evidently's normed Wasserstein turns that into a magnitude of ~10×. The other drifted features get multiplicative factors of 1.1×–1.2× on wider-range columns, which produce magnitudes of only ~2–4×. **The ranking you see in the chart falls straight out of these config choices.**
+> - The `drift_generation.default_drift` block in `src/config/config.yaml` is what determines the shape and magnitude of drift injected into the demo dataset. The author picked five features to drift and tuned the shift/factor per feature. `num_transactions_24h` gets an additive `shift: 1` — and because that feature is a PCA component with near-unit standard deviation (Kaggle's `V14`, renamed for readability via the `kaggle_column_map` in `config.yaml` / `src/setup/download_kaggle_dataset.py`), a +1 shift moves the distribution by ~1σ. Evidently's normed Wasserstein turns that into a magnitude of ~10×. The other drifted features get multiplicative factors of 1.1×–1.2× on wider-range columns, which produce magnitudes of only ~2–4×. **The ranking you see in the chart falls straight out of these config choices.**
 > - SHAP importance is computed offline against the trained model in `notebooks/7_optional_shap_explainability.ipynb`. It reflects what the model actually relies on, and it doesn't change if you edit the drift config.
 > - **What happens if you change the config?** Edit `config.yaml` — bump `distance_from_home_km`'s factor from 1.2 → 1.5, or drop `num_transactions_24h`'s shift from 1 → 0.1 — and the QuickSight ranking will reshuffle to match your new config on the very next drift run. **The SHAP chart will not move**, because retuning drift generation doesn't retrain the model. That asymmetry is the point: SHAP tells you what mattered to the model regardless of what synthetic scenario you're simulating this month.
 > - **What this teaches.** The demo is set up so drift alignment with SHAP looks meaningful because the config author drifted a feature that also happens to be top-SHAP. In real production drift there's no reason those would line up. The right takeaway is the *methodology* — always cross-reference drift with SHAP before prioritizing — not "QuickSight tends to surface important features."
@@ -880,7 +859,7 @@ In **dev/test**, ground truth is simulated by `src/drift_monitoring/simulate_gro
 
 ## Bring Your Own Dataset
 
-The feature set, target column, train/eval split, drift thresholds, and ground-truth simulator are all config-driven — no pipeline code changes are required to run this solution on a different dataset. The steps below walk through every touchpoint from raw data to a published dashboard.
+The feature set, target column, train/eval split, and drift thresholds are config-driven — no *pipeline* code changes are required to run this solution on a different dataset. Two things do need attention beyond `config.yaml`: the scheduled drift-monitor Lambda reads deploy-time env vars (not `config.yaml` — see step 4), and a few QuickSight display labels are hardcoded for the fraud demo (see step 7). The steps below walk through every touchpoint from raw data to a published dashboard.
 
 ### 1. Redefine the schema
 
@@ -925,7 +904,7 @@ ATHENA_EVALUATION_TABLE=your_eval_table
 
 The preprocessing PySpark step reads Athena directly in both paths.
 
-**Route B — Your data is in Snowflake, Redshift, BigQuery, or another warehouse.**
+**Route B — Your data is in Snowflake, Redshift, BigQuery, Athena, or another warehouse.**
 Two options depending on volume:
 1. **Federate via Athena** — set up an [Athena federated query connector](https://docs.aws.amazon.com/athena/latest/ug/connect-to-a-data-source.html) for your warehouse, then use Route A pointing at the federated table. Zero data copy.
 2. **UNLOAD once to S3** — dump the warehouse table to Parquet/CSV in your S3 data bucket, then either register it as an external Athena table (Route A) or use Route C's CSV path.
@@ -950,36 +929,45 @@ In all three routes: the CSV format is a convenience for the reference dataset, 
 Ground truth arrives asynchronously in most production ML systems (fraud investigations, delivery confirmations, refund windows). The reference implementation has two paths — pick the one that matches your reality:
 
 **Production path** — real labels from an upstream system:
-- Land labels in the `ground_truth_updates` Athena table (schema: `identifier_column`, `ground_truth` value, `label_timestamp`).
-- Run `python -m src.drift_monitoring.update_ground_truth --mode batch` on your desired cadence. This MERGEs updates into `inference_responses` on `identifier_column`, populating `ground_truth` and `ground_truth_received_at`.
+- Land labels in the `ground_truth_updates` Athena table. Schema: `inference_id`, `actual_fraud` (BOOLEAN — the confirmed label; rename/repurpose for your target), `confirmation_timestamp`, `confirmation_source`, `days_since_prediction`.
+- Run `python -m src.drift_monitoring.update_ground_truth --mode batch` on your desired cadence. This Iceberg-MERGEs updates into `inference_responses` on `inference_id`, populating `ground_truth`, `ground_truth_timestamp`, `ground_truth_source`, and `days_to_ground_truth`. (Add `--dry-run` to preview, `--force` to re-apply.)
 - Wire your upstream system's write to `ground_truth_updates` (Firehose, Lambda, or a scheduled ETL — whatever fits).
 
 **Dev/test path** — simulated labels:
-- Tune the simulator in `src/config/config.yaml` under `ground_truth_simulation`: `accuracy` (base label-flip rate), `feature_drift_impact` (extra accuracy penalty proportional to observed data drift), `model_drift_magnitude` (extra accuracy penalty simulating pure concept drift), `fraud_confirmation_days` / `non_fraud_confirmation_days` (delay windows).
+- Tune the simulator with CLI flags: `--accuracy` (base label-flip rate, default 0.85), `--fraud-days` / `--non-fraud-days` (confirmation delay ranges as `min,max`, defaults `1,7` / `1,30`), `--seed`. Notebook 2 injects extra drift-driven error via the `GROUND_TRUTH_SIM_FEATURE_DRIFT_IMPACT` and `GROUND_TRUTH_SIM_MODEL_DRIFT_MAG` env vars (both default `0.0`; effective accuracy = base − feature_drift_impact − model_drift_magnitude, floored at 0.5). These are simulator knobs, not `config.yaml` keys.
 - Run `python -m src.drift_monitoring.simulate_ground_truth_from_athena` — writes to `ground_truth_updates`, then apply as above.
 
 If your target column isn't binary, replace `simulate_ground_truth_from_athena.py`'s label-flipping logic with whatever synthetic-label rule fits your problem (regression noise, multi-class perturbation, etc.). The MERGE-based `update_ground_truth.py` is target-type-agnostic.
 
 ### 4. Tune drift thresholds and lookbacks in `config.yaml`
 
-`src/config/config.yaml` centralizes every runtime knob — the drift Lambda, notebook, and CloudWatch alarms all read from it (with env-var overrides). Edit the values that matter for your workload:
+`src/config/config.yaml` centralizes the runtime knobs read by the notebooks, `monitor_model_performance.py`, and CloudFormation. **Important:** the scheduled drift-monitor Lambda does *not* read `config.yaml` — it runs from a container image and reads its own **environment variables**, set at deploy time in `scripts/deploy_lambda_container.sh`. So knobs split into two groups.
 
-- `drift.data_drift_threshold` / `drift.model_drift_threshold` — PSI and ROC-AUC-degradation cutoffs that trip SNS alerts. Default is 0.2 / 0.05. Move these down for a chattier system (more false positives, fewer misses) or up for a quieter one.
-- `monitoring.data_drift_lookback_days` / `monitoring.model_drift_lookback_days` — how far back the Lambda scans `inference_responses` on each daily run. Default 7 / 30. Low-volume endpoints need larger windows for statistically stable KS tests.
-- `drift.min_samples_for_drift` — bail out of the KS test if fewer rows are available (default 50).
-- `evidently.num_stat_test` — override the numerical drift test (`ks`, `wasserstein`, `jensen_shannon`, `psi`, `kl_div`). Categorical test is always chi-square.
-- `drift_generation.default_drift` — parameters for the synthetic drifted-data generator (dev/test only). Amplitude per feature, drift direction, share of drifted features.
-- `ground_truth_simulation.*` — see step 3.
+**Configured in `config.yaml`:**
+
+- `drift_thresholds.data_drift` / `drift_thresholds.model_drift` — data-drift share and ROC-AUC-degradation cutoffs that trip SNS alerts. Defaults `0.20` / `0.05`. Move down for a chattier system (more false positives, fewer misses) or up for a quieter one.
+- `drift_thresholds.min_roc_auc` — absolute ROC-AUC alert floor used by `monitor_model_performance.py` (default `0.85`).
+- `drift_generation.default_drift` — parameters for the synthetic drifted-data generator (dev/test only): per-feature amplitude, drift direction, share of drifted features.
 - **`inference.prediction_column` / `inference.probability_column` / `inference.probability_alt_column`** — column names your inference handler writes to `inference_responses`. Defaults `prediction` / `probability_fraud` / `probability_non_fraud`. Override if your endpoint emits differently-named prediction/score columns; downstream (drift Lambda, dashboards, batch transform) reads these constants everywhere, so a single edit propagates.
-- **`training.objective` / `training.num_class`** — XGBoost objective override. Leave `objective` empty to auto-derive from `schema.target_type()`: `boolean → binary:logistic + scale_pos_weight`; `integer` with N=2 → binary, with N>2 → `multi:softprob` (also set `num_class`); `double → reg:squarederror` (regression, no scale_pos_weight). Set explicitly for edge cases: `reg:logistic`, `binary:hinge`, `rank:pairwise`, etc.
+- **`training.objective` / `training.num_class`** — XGBoost objective override. Leave `objective` empty (`""`) to auto-derive from `schema.target_type()`: `boolean → binary:logistic + scale_pos_weight`; `integer` with N=2 → binary, with N>2 → `multi:softprob` (also set `num_class`); `double → reg:squarederror` (regression, no scale_pos_weight). Set explicitly for edge cases: `reg:logistic`, `binary:hinge`, `rank:pairwise`, etc.
 
-Config changes are picked up on the next Lambda invocation (no redeploy required for value changes; you *do* need to redeploy if you change env-var *names*). To retune thresholds on a live Lambda without waiting for the next cold-start:
+**Set as Lambda env vars in `scripts/deploy_lambda_container.sh`** (there is no `config.yaml` key for these — editing YAML has no effect on the scheduled Lambda; you must edit the deploy script and redeploy, or patch the live Lambda's env — see below):
+
+- `DATA_DRIFT_LOOKBACK_DAYS` / `MODEL_DRIFT_LOOKBACK_DAYS` — how far back the Lambda scans `inference_responses` for data-drift and model-drift respectively. The Lambda's *code* fallbacks are `7` / `30`, but the deploy script currently ships **`1` / `1`** (tuned for a fast demo loop). Low-volume endpoints, or any setup where ground truth lands more than a day after inference, need larger windows — a too-short `MODEL_DRIFT_LOOKBACK_DAYS` is the usual reason the "Current ROC-AUC" visuals come up empty.
+- `MIN_SAMPLES` — minimum labeled rows within the model-drift window before ROC-AUC is computed (fallback `100`). Below this the run records NULL performance metrics.
+- `KS_PVALUE_THRESHOLD` (fallback `0.05`) and `BASELINE_ROC_AUC` (fallback `0.92`, only used when no registered `baseline.json` is found).
+
+> Evidently auto-selects the per-feature statistical test by sample size (p-value tests like KS/Chi-square on small samples, distance tests like Wasserstein/Jensen-Shannon on large ones); this project does not expose a single "pick the test" config key.
+
+`config.yaml` value changes are picked up on the next notebook/CLI run with no redeploy. **Lambda env-var changes require a redeploy** (`python main.py monitoring deploy-lambda`) — or, to retune the two alert *thresholds* on a live Lambda without a full rebuild:
 
 ```bash
 python main.py monitoring update-thresholds \
     --data-drift-threshold 0.15 \
     --model-drift-threshold 0.03
 ```
+
+⚠️ By default `update-thresholds` **replaces** the Lambda's entire env-var set, dropping everything else (endpoint name, lookbacks, SQS URL, …). Use it only for the two thresholds it manages, or pass the merge option; for anything else, edit `deploy_lambda_container.sh` and redeploy.
 
 ### 5. Recreate the Athena tables
 
@@ -1020,7 +1008,15 @@ python main.py dashboard delete --confirm
 python main.py dashboard create
 ```
 
-If you renamed the target or added/removed calculated columns (e.g., `risk_tier`, `drift_severity`), edit the visual definitions in `src/governance/create_governance_dashboard.py` — search for `build_inference_visuals`, `build_drift_visuals`, `build_feature_drift_visuals`, `build_feature_level_visuals` and update the field references, then rerun `dashboard create`.
+If you renamed the target or added/removed calculated columns (e.g., `risk_tier`, `drift_severity`), edit the visual definitions in `src/governance/create_governance_dashboard.py` — search for `build_model_drift_visuals`, `build_data_drift_visuals`, `build_feature_drift_visuals` and update the field references, then rerun `dashboard create`.
+
+**Fraud-domain labels you may want to rename.** The column *bindings* are schema-driven, so a BYO dataset shows correct data automatically — but some **display strings and calculated-column logic are hardcoded for the fraud demo**. None break the dashboard; they just read oddly (and two are semantically classification-specific). Adjust in `src/governance/create_governance_dashboard.py` unless noted:
+
+- **Dashboard & analysis titles** — default to `"Fraud Detection Governance"` / `"Fraud Detection Governance Analysis"` (`QUICKSIGHT_DASHBOARD_NAME` / `QUICKSIGHT_ANALYSIS_NAME` in `src/config/config.py`). Rename there, or in the QuickSight console.
+- **`performance_status` buckets** — `ROC-AUC ≥ 0.95 → GOOD, ≥ 0.90 → WARNING, else CRITICAL`. These thresholds assume a high-AUC classifier; **for a regression target they are meaningless** — adjust or drop the calculated column.
+- **`risk_tier` / `drift_severity` buckets** — probability/severity cutoffs (e.g. `0.2 / 0.5 / 0.8`) tuned for binary fraud scoring; revisit for other target types.
+- **CustomSql aliases** — `avg_fraud_prob`, `predicted_fraud`, `actual_fraud` appear in the dataset SQL and as visual field labels; rename if the fraud wording is distracting.
+- **Visual titles** — several carry fraud framing. Any of them can be renamed in the console without touching code.
 
 > 💡 **QuickSight supports interactive visual editing.** Every dashboard published by this project is backed by a QuickSight *analysis* of the same name — open the analysis in the QuickSight console to drag-and-drop new fields, add filters, change chart types, or spin off ad-hoc visuals without touching the Python module. Changes made in the analysis can be re-published to the dashboard from the console. Persist any edits you want in version control by porting them back into `create_governance_dashboard.py`'s visual builders; otherwise a subsequent `dashboard create --force` will overwrite the console edits with the code-defined layout.
 

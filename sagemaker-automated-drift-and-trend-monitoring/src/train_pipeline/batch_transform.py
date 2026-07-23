@@ -53,6 +53,7 @@ from src.config.config import (
     ATHENA_GROUND_TRUTH_TABLE,
     ATHENA_DATABASE,
 )
+from src.config import schema
 from src.train_pipeline.athena.athena_client import AthenaClient
 from src.utils.mlflow_utils import setup_mlflow_tracking, get_or_create_experiment
 from src.utils.aws_utils import get_sagemaker_session, get_execution_role
@@ -98,12 +99,19 @@ def export_athena_to_s3(
 
         logger.info(f"Exporting {row_count:,} rows to S3")
 
-        # Drop columns not needed for inference
-        columns_to_drop = ['is_fraud', 'fraud_prediction', 'fraud_probability',
-                          'ground_truth', 'ground_truth_fraud', 'observed_fraud',
+        # Drop columns not needed for inference. The target, auxiliary, and
+        # identifier columns come from dataset_schema.yaml (so a BYO dataset
+        # drops its own, not the fraud-specific names); the rest are generic
+        # bookkeeping/ground-truth columns that may exist on the source table.
+        schema_drop_cols = (
+            [schema.target_column(), schema.identifier_column()]
+            + [c.name for c in schema.auxiliary_columns()]
+        )
+        extra_drop_cols = ['ground_truth', 'ground_truth_fraud', 'observed_fraud',
                           'data_version', 'created_at', 'updated_at',
                           'ingestion_timestamp', 'batch_id', 'data_source',
-                          'transaction_id', 'customer_id']  # Also drop IDs
+                          'customer_id']
+        columns_to_drop = schema_drop_cols + extra_drop_cols
 
         # Drop columns that exist
         df = df.drop(*[col for col in columns_to_drop if col in df.columns])

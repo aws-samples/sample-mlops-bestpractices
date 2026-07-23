@@ -34,7 +34,9 @@ from src.config.config import (
     CSV_TRAINING_DATA,
     ATHENA_TRAINING_TABLE,
     ATHENA_DATABASE,
+    PROBABILITY_COLUMN,
 )
+from src.config import schema
 from src.train_pipeline.athena.athena_client import AthenaClient
 
 logger = logging.getLogger(__name__)
@@ -120,9 +122,13 @@ def test_endpoint_realtime(
 
     for idx, row in test_data.iterrows():
         try:
-            # Prepare input (drop target column if present)
-            input_dict = row.drop(['is_fraud', 'fraud_prediction', 'fraud_probability'],
-                                 errors='ignore').to_dict()
+            # Prepare input (drop target + auxiliary/label columns if present).
+            # Derived from dataset_schema.yaml so a BYO dataset drops its own
+            # target/aux columns rather than the fraud-specific names.
+            non_feature_cols = [schema.target_column()] + [
+                c.name for c in schema.auxiliary_columns()
+            ]
+            input_dict = row.drop(non_feature_cols, errors='ignore').to_dict()
 
             # Invoke endpoint
             start_time = time.time()
@@ -175,7 +181,7 @@ def query_athena_metrics(
         query = f"""
         SELECT
             COUNT(*) as total_predictions,
-            AVG(probability_fraud) as avg_fraud_prob,
+            AVG({PROBABILITY_COLUMN}) as avg_fraud_prob,
             SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as fraud_count,
             SUM(CASE WHEN prediction = 0 THEN 1 ELSE 0 END) as non_fraud_count,
             AVG(inference_latency_ms) as avg_latency_ms,
