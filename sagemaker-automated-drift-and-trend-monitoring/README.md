@@ -1,6 +1,6 @@
 # Automated Drift and Trend Monitoring for ML Models on Amazon SageMaker
 
-End-to-end MLOps reference architecture for credit card fraud detection with automated drift detection, ground truth integration, and governance dashboard. Built on SageMaker Pipelines, MLflow, Evidently AI, and Amazon Quick (also referred to as QuickSight).
+End-to-end MLOps reference architecture for credit card fraud detection with automated drift detection, ground truth integration, and governance dashboard. Built on SageMaker Pipelines, MLflow, Evidently AI, and Amazon Quick (previously Amazon QuickSight — the two names refer to the same service in this document).
 
 ## Architecture
 
