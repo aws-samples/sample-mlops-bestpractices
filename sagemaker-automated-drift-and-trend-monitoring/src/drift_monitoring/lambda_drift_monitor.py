@@ -512,7 +512,12 @@ def check_data_drift():
         'drifted_features_count': drifted_count,
         'drift_percentage': drift_share * 100,
         'drifted_columns_share': drift_share,
-        'drifted_features': drifted_features[:5],  # Top 5
+        'drifted_features': drifted_features[:5],  # Top 5 — used for the SNS alert only
+        # Full per-column result (every feature, drifted or not). Persisted to
+        # monitoring_responses.per_feature_drift_scores so the governance
+        # dashboard sees the same complete feature set the notebook writes —
+        # not just the top-5 alert subset.
+        'per_column': per_column,
         'sample_size': len(current_rows),
         'html_report_path': html_path,
     }
@@ -1040,15 +1045,22 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     # Build per-feature drift scores JSON. Nested per-feature object so the
     # governance dashboard can plot the test-agnostic magnitude alongside the
     # raw score. The feature_drift_detail Athena view parses this shape
-    # (MAP(VARCHAR, JSON)); legacy flat rows still read via its TRY_CAST path.
+    # (MAP(VARCHAR, JSON)).
+    #
+    # Write EVERY analyzed feature (drifted or not) from the full per_column
+    # result, matching what notebook 3 (cell "Write the monitoring run")
+    # persists. The `drifted_features` list is filtered + top-5 capped for the
+    # SNS alert; using it here would drop non-drifted and beyond-top-5 features
+    # from the dashboard, so Lambda-generated runs would show a thinner feature
+    # set than notebook-generated ones. Iterate per_column instead.
     per_feature = {}
     if data_drift_result:
-        for feat_info in data_drift_result.get('drifted_features', []):
-            per_feature[feat_info['feature']] = {
-                'score': feat_info.get('drift_score', 0),
-                'magnitude': feat_info.get('drift_magnitude', 0),
-                'method': feat_info.get('method', ''),
-                'threshold': feat_info.get('threshold', 0),
+        for col, info in data_drift_result.get('per_column', {}).items():
+            per_feature[col] = {
+                'score': info.get('drift_score', 0),
+                'magnitude': info.get('drift_magnitude', 0),
+                'method': info.get('method', ''),
+                'threshold': info.get('threshold', 0),
             }
 
     # Compute F1 from precision and recall if model drift available
