@@ -52,6 +52,8 @@ from src.config.config import (
     ATHENA_DATABASE,
     ATHENA_INFERENCE_TABLE,
     MIN_ROC_AUC_THRESHOLD,
+    PROBABILITY_COLUMN,
+    PROBABILITY_ALT_COLUMN,
 )
 
 logging.basicConfig(
@@ -156,6 +158,15 @@ class ModelPerformanceMonitor:
         """
         logger.info("Loading predictions with ground truth...")
 
+        # Select the config-driven probability columns but alias them to the
+        # stable in-Python names (`probability_fraud` / `probability_non_fraud`)
+        # so the metric code below is independent of the physical column names
+        # in a BYO deployment. The alt (other-class) probability is optional —
+        # only selected when configured (non-binary targets leave it empty).
+        alt_prob_select = (
+            f"{PROBABILITY_ALT_COLUMN} AS probability_non_fraud,"
+            if PROBABILITY_ALT_COLUMN else ""
+        )
         query = f"""
         SELECT
             inference_id,
@@ -166,8 +177,8 @@ class ModelPerformanceMonitor:
             transaction_id,
             transaction_amount,
             prediction,
-            probability_fraud,
-            probability_non_fraud,
+            {PROBABILITY_COLUMN} AS probability_fraud,
+            {alt_prob_select}
             confidence_score,
             ground_truth,
             ground_truth_timestamp,

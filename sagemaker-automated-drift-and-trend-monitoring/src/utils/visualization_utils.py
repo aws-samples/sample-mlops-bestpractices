@@ -20,6 +20,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 
+from src.config.config import (
+    ATHENA_DATABASE,
+    ATHENA_INFERENCE_TABLE,
+    PROBABILITY_COLUMN,
+)
+
+# Fully-qualified inference table, config-driven so BYO deployments that
+# rename the database/table don't have to edit these queries.
+_INFERENCE_TABLE_FQN = f"{ATHENA_DATABASE}.{ATHENA_INFERENCE_TABLE}"
+
 logger = logging.getLogger(__name__)
 
 # Set style for all plots
@@ -60,8 +70,8 @@ def create_roc_curve_from_athena(
     query = f"""
     SELECT
         ground_truth,
-        probability_fraud
-    FROM fraud_detection.inference_responses
+        {PROBABILITY_COLUMN} AS probability_fraud
+    FROM {_INFERENCE_TABLE_FQN}
     WHERE endpoint_name = '{endpoint_name}'
       AND ground_truth IS NOT NULL
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
@@ -154,9 +164,9 @@ def create_confusion_matrix_from_athena(
     query = f"""
     SELECT
         ground_truth,
-        probability_fraud,
+        {PROBABILITY_COLUMN} AS probability_fraud,
         prediction
-    FROM fraud_detection.inference_responses
+    FROM {_INFERENCE_TABLE_FQN}
     WHERE endpoint_name = '{endpoint_name}'
       AND ground_truth IS NOT NULL
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
@@ -283,9 +293,9 @@ def create_prediction_distribution(
         {trunc_func} as time_bucket,
         COUNT(*) as total_predictions,
         SUM(CASE WHEN prediction = 1 THEN 1 ELSE 0 END) as fraud_predictions,
-        AVG(probability_fraud) as avg_fraud_prob,
+        AVG({PROBABILITY_COLUMN}) as avg_fraud_prob,
         AVG(confidence_score) as avg_confidence
-    FROM fraud_detection.inference_responses
+    FROM {_INFERENCE_TABLE_FQN}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
                                 AND TIMESTAMP '{end_date.isoformat()}'
@@ -399,7 +409,7 @@ def create_latency_heatmap(
         AVG(inference_latency_ms) as avg_latency,
         STDDEV(inference_latency_ms) as std_latency,
         COUNT(*) as request_count
-    FROM fraud_detection.inference_responses
+    FROM {_INFERENCE_TABLE_FQN}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp > CURRENT_TIMESTAMP - INTERVAL '{days}' DAY
     GROUP BY DATE_TRUNC('day', request_timestamp), EXTRACT(HOUR FROM request_timestamp)
@@ -489,7 +499,7 @@ def create_confidence_distribution(
         prediction,
         is_high_confidence,
         is_low_confidence
-    FROM fraud_detection.inference_responses
+    FROM {_INFERENCE_TABLE_FQN}
     WHERE endpoint_name = '{endpoint_name}'
       AND request_timestamp BETWEEN TIMESTAMP '{start_date.isoformat()}'
                                 AND TIMESTAMP '{end_date.isoformat()}'

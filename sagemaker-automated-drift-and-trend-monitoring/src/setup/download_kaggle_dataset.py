@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Download the Kaggle credit-card fraud dataset, transform to the project's
-business-friendly schema, and upload it to S3.
+Download the configured Kaggle dataset, transform it to the project's
+schema, and upload it to S3.
+
+The dataset slug, the raw-column-to-schema rename map, and the synthetic
+demo columns all come from config.yaml (data_download section) and
+dataset_schema.yaml — nothing is hardcoded to the credit-card fraud use
+case, so a BYO-dataset user only edits those two YAML files.
 
 The Athena `training_data` table is created (empty) by the CloudFormation
 lifecycle script and populated by the SageMaker pipeline's seed step —
@@ -41,6 +46,14 @@ from src.config.config import (  # noqa: E402
     AWS_DEFAULT_REGION,
     DATA_S3_BUCKET,
     DATA_S3_PREFIX,
+    CSV_TRAINING_DATA,
+    DATA_DOWNLOAD_RANDOM_STATE,
+    KAGGLE_DATASET,
+    KAGGLE_CSV_FILENAME,
+    KAGGLE_COLUMN_MAP,
+    SYNTHETIC_GENDER_COLUMN,
+    SYNTHETIC_GENDER_CATEGORIES,
+    SYNTHETIC_GENDER_WEIGHTS,
 )
 from src.config import schema  # noqa: E402
 
@@ -52,62 +65,47 @@ if not logger.handlers:
     logger.addHandler(_h)
 
 
-RANDOM_STATE = 42
-# Local CSV is written to the project's data/ scratch directory — the same
-# location used by the drift-dataset generators (data/creditcard_drifted.csv,
-# data/drifted_data_runN.csv) and read by notebook 2.
-_DATA_DIR = _PROJECT_ROOT / "data"
-LOCAL_CSV = _DATA_DIR / "creditcard_predictions_final.csv"
+# Seed for the synthetic demo columns — from config.yaml data_download.random_state.
+RANDOM_STATE = DATA_DOWNLOAD_RANDOM_STATE
+# Local CSV path is the config-declared training-data path (config.yaml
+# data.csv_training_data). The drift-dataset generators and notebook 2 read
+# the same constant, so the filename lives in exactly one place.
+LOCAL_CSV = CSV_TRAINING_DATA
+_DATA_DIR = LOCAL_CSV.parent
+_CSV_FILENAME = LOCAL_CSV.name
 
-# S3 keys the pipeline seed step reads from.
+# S3 keys the pipeline seed step reads from. The seed step reads
+# `data/predictions/data.csv` (a fixed pipeline convention); the archive copy
+# keeps the human-readable CSV filename from the config path above.
 _PREDICTIONS_KEY = f"{DATA_S3_PREFIX}data/predictions/data.csv"
-_ARCHIVE_KEY = f"{DATA_S3_PREFIX}data/creditcard_predictions_final.csv"
+_ARCHIVE_KEY = f"{DATA_S3_PREFIX}data/{_CSV_FILENAME}"
 
-GENDERS = ["Male", "Female", "Other"]
-GENDER_WEIGHTS = [0.45, 0.45, 0.10]
+# Synthetic categorical column config (config.yaml data_download.synthetic_gender_*).
+# The raw source has no categorical feature, so one is fabricated to exercise
+# the string-feature path. Empty column name disables synthesis entirely.
+GENDERS = SYNTHETIC_GENDER_CATEGORIES
+GENDER_WEIGHTS = SYNTHETIC_GENDER_WEIGHTS
 
-# Kaggle V1..V28 are anonymized PCA components. We relabel them with
-# business-friendly names; values are unchanged. The rename is purely cosmetic
-# — V14 (renamed `num_transactions_24h`) keeps its real predictive power.
-KAGGLE_COLUMN_MAP = {
-    "Time": "transaction_timestamp",
-    "V1": "transaction_hour",
-    "V2": "transaction_day_of_week",
-    "V3": "customer_age",
-    "V4": "account_age_days",
-    "V5": "merchant_category_code",
-    "V6": "distance_from_home_km",
-    "V7": "distance_from_last_transaction_km",
-    "V8": "online_transaction",
-    "V9": "chip_transaction",
-    "V10": "pin_used",
-    "V11": "recurring_transaction",
-    "V12": "international_transaction",
-    "V13": "high_risk_country",
-    "V14": "num_transactions_24h",
-    "V15": "num_transactions_7days",
-    "V16": "avg_transaction_amount_30days",
-    "V17": "max_transaction_amount_30days",
-    "V18": "card_present",
-    "V19": "address_verification_match",
-    "V20": "cvv_match",
-    "V21": "velocity_score",
-    "V22": "merchant_reputation_score",
-    "V23": "time_since_last_transaction_min",
-    "V24": "transaction_type_code",
-    "V25": "customer_tenure_months",
-    "V26": "credit_limit",
-    "V27": "available_credit_ratio",
-    "V28": "previous_fraud_incidents",
-    "Amount": "transaction_amount",
-    "Class": "is_fraud",
-}
+# Raw source column -> project schema column. The source uses anonymized
+# names; this map (config.yaml data_download.kaggle_column_map) relabels them
+# with the business-friendly names declared in dataset_schema.yaml. Values are
+# unchanged — the rename is purely cosmetic.
+#
+# Schema-driven column roles (all from dataset_schema.yaml — nothing fraud-
+# specific is hardcoded here):
+_IDENTIFIER_COLUMN = schema.identifier_column()   # e.g. transaction_id
+_TARGET_COLUMN = schema.target_column()           # e.g. is_fraud
+# Auxiliary columns are the non-feature carry-through columns (a prior
+# prediction + its probability, for audit). We fabricate them below, matching
+# each by declared type: boolean aux <- prediction, double aux <- probability.
+_AUX_COLUMNS = schema.auxiliary_columns()
+_AUX_BOOL_COLUMN = next((c.name for c in _AUX_COLUMNS if c.type == "boolean"), None)
+_AUX_PROB_COLUMN = next((c.name for c in _AUX_COLUMNS if c.type == "double"), None)
 
-# Canonical column order for creditcard_predictions_final.csv, driven by
-# dataset_schema.yaml via src.config.schema. The pipeline seed step
-# (seed_athena_tables.py) uses this exact same order to declare its
-# staging table — both derive it from the same source, so they can never
-# drift apart.
+# Canonical column order for the predictions CSV, driven by dataset_schema.yaml
+# via src.config.schema. The pipeline seed step (seed_athena_tables.py) uses
+# this exact same order to declare its staging table — both derive it from the
+# same source, so they can never drift apart.
 CSV_COLUMN_ORDER = schema.csv_column_order()
 
 
@@ -115,12 +113,12 @@ CSV_COLUMN_ORDER = schema.csv_column_order()
 # Step 1 — Download + transform Kaggle data into the project's schema
 # ---------------------------------------------------------------------------
 def download_and_transform() -> Path:
-    """Download Kaggle creditcardfraud, rename columns, write local CSV."""
+    """Download the configured dataset, rename columns, write local CSV."""
     import kagglehub  # imported lazily so test environments don't need it
 
-    logger.info("Downloading Kaggle credit-card fraud dataset (mlg-ulb/creditcardfraud)…")
-    dataset_path = kagglehub.dataset_download("mlg-ulb/creditcardfraud")
-    csv_path = Path(dataset_path) / "creditcard.csv"
+    logger.info("Downloading Kaggle dataset (%s)…", KAGGLE_DATASET)
+    dataset_path = kagglehub.dataset_download(KAGGLE_DATASET)
+    csv_path = Path(dataset_path) / KAGGLE_CSV_FILENAME
 
     logger.info("Transforming to project schema…")
     df = pd.read_csv(csv_path)
@@ -128,18 +126,32 @@ def download_and_transform() -> Path:
 
     rng = np.random.default_rng(RANDOM_STATE)
     n = len(df)
-    is_fraud = df["is_fraud"].astype(bool).values
 
-    fraud_prob = np.where(
-        is_fraud,
-        rng.uniform(0.5, 0.99, n),
-        rng.uniform(0.01, 0.25, n),
-    )
+    # Insert the identifier column (schema.identifier_column()) as a simple
+    # monotonic row id.
+    df.insert(0, _IDENTIFIER_COLUMN, np.arange(n))
 
-    df.insert(0, "transaction_id", np.arange(n))
-    df["fraud_prediction"] = fraud_prob > 0.5
-    df["fraud_probability"] = np.round(fraud_prob, 16)
-    df["customer_gender"] = rng.choice(GENDERS, size=n, p=GENDER_WEIGHTS)
+    # Fabricate the auxiliary "prior prediction" columns so the CSV carries a
+    # realistic stored prediction + probability for auditability. The synthetic
+    # probability correlates with the target so the demo prediction is roughly
+    # accurate. Skipped cleanly if the schema declares no such aux columns.
+    if _AUX_PROB_COLUMN or _AUX_BOOL_COLUMN:
+        target_positive = df[_TARGET_COLUMN].astype(bool).values
+        prob = np.where(
+            target_positive,
+            rng.uniform(0.5, 0.99, n),
+            rng.uniform(0.01, 0.25, n),
+        )
+        if _AUX_PROB_COLUMN:
+            df[_AUX_PROB_COLUMN] = np.round(prob, 16)
+        if _AUX_BOOL_COLUMN:
+            df[_AUX_BOOL_COLUMN] = prob > 0.5
+
+    # Synthesize the categorical demo column, if configured. The raw source has
+    # no string feature, so this fabricates one to exercise the categorical
+    # path. Disabled when SYNTHETIC_GENDER_COLUMN is empty.
+    if SYNTHETIC_GENDER_COLUMN and GENDERS:
+        df[SYNTHETIC_GENDER_COLUMN] = rng.choice(GENDERS, size=n, p=GENDER_WEIGHTS)
 
     df = df[CSV_COLUMN_ORDER]
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -152,10 +164,10 @@ def download_and_transform() -> Path:
 # Step 2 — Upload to S3 (both the canonical archive and the seeding location)
 # ---------------------------------------------------------------------------
 def upload_to_s3() -> None:
-    """Upload the local CSV to s3://.../data/{predictions/data.csv,creditcard_predictions_final.csv}.
+    """Upload the local CSV to two S3 keys under data/.
 
-    The pipeline seed step reads from `predictions/data.csv`; the
-    `creditcard_predictions_final.csv` copy is a human-readable archive.
+    The pipeline seed step reads from `predictions/data.csv`; the second copy
+    (named after the config CSV filename) is a human-readable archive.
     """
     if not DATA_S3_BUCKET:
         raise RuntimeError(

@@ -384,9 +384,33 @@ S3_CSV_DRIFTED_DATA: str = _get(
 )
 
 # ===================================================================
+# Training-data download (source dataset -> project schema)
+# ===================================================================
+# Consumed only by src/setup/download_kaggle_dataset.py. All values come from
+# config.yaml's `data_download` section so the loader has no hardcoded,
+# fraud-specific literals. To BYO a differently-shaped dataset, edit that
+# section (and dataset_schema.yaml) — or replace the loader entirely.
+_data_dl_cfg = _yaml_cfg.get("data_download", {}) if isinstance(
+    _yaml_cfg.get("data_download"), dict
+) else {}
+
+KAGGLE_DATASET: str = _get(
+    "data_download", "kaggle_dataset", "KAGGLE_DATASET", "mlg-ulb/creditcardfraud"
+)
+KAGGLE_CSV_FILENAME: str = _get(
+    "data_download", "kaggle_csv_filename", "KAGGLE_CSV_FILENAME", "creditcard.csv"
+)
+DATA_DOWNLOAD_RANDOM_STATE: int = int(
+    _get("data_download", "random_state", "DATA_DOWNLOAD_RANDOM_STATE", "42")
+)
+KAGGLE_COLUMN_MAP: dict = _data_dl_cfg.get("kaggle_column_map") or {}
+SYNTHETIC_GENDER_COLUMN: str = _data_dl_cfg.get("synthetic_gender_column", "") or ""
+SYNTHETIC_GENDER_CATEGORIES: list = _data_dl_cfg.get("synthetic_gender_categories") or []
+SYNTHETIC_GENDER_WEIGHTS: list = _data_dl_cfg.get("synthetic_gender_weights") or []
+
+# ===================================================================
 # Training
 # ===================================================================
-RANDOM_STATE: int = int(_get("training", "random_state", "RANDOM_STATE", "42"))
 
 # Target column name and feature list are dataset-shape concerns, not
 # infrastructure config — they live in src/config/dataset_schema.yaml and

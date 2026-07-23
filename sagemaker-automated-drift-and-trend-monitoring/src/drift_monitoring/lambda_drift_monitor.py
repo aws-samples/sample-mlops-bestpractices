@@ -484,10 +484,17 @@ def check_data_drift():
             drifted_features.append({
                 'feature': col,
                 'drift_score': info.get('drift_score', 0),
+                'drift_magnitude': info.get('drift_magnitude', 0),
+                'method': info.get('method', ''),
+                'threshold': info.get('threshold', 0),
             })
 
-    # Sort by drift score ascending (lower p-value = more drifted)
-    drifted_features.sort(key=lambda x: x['drift_score'])
+    # Sort by drift_magnitude descending (higher = more drifted). Magnitude is
+    # test-agnostic and bounded because evidently_reports forces the
+    # jensenshannon distance metric for every column, so this ranks features by
+    # drift severity rather than by raw p-value precision (see the
+    # evidently_reports module docstring for why the metric is pinned).
+    drifted_features.sort(key=lambda x: x['drift_magnitude'], reverse=True)
 
     features_analyzed = len(per_column)
     drifted_count = drift_result['drifted_columns_count']
@@ -505,7 +512,12 @@ def check_data_drift():
         'drifted_features_count': drifted_count,
         'drift_percentage': drift_share * 100,
         'drifted_columns_share': drift_share,
-        'drifted_features': drifted_features[:5],  # Top 5
+        'drifted_features': drifted_features[:5],  # Top 5 — used for the SNS alert only
+        # Full per-column result (every feature, drifted or not). Persisted to
+        # monitoring_responses.per_feature_drift_scores so the governance
+        # dashboard sees the same complete feature set the notebook writes —
+        # not just the top-5 alert subset.
+        'per_column': per_column,
         'sample_size': len(current_rows),
         'html_report_path': html_path,
     }
@@ -1030,11 +1042,26 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
     now = datetime.now()
     run_id = f"drift-{now.strftime('%Y%m%d-%H%M%S')}"
 
-    # Build per-feature drift scores JSON
+    # Build per-feature drift scores JSON. Nested per-feature object so the
+    # governance dashboard can plot the test-agnostic magnitude alongside the
+    # raw score. The feature_drift_detail Athena view parses this shape
+    # (MAP(VARCHAR, JSON)).
+    #
+    # Write EVERY analyzed feature (drifted or not) from the full per_column
+    # result, matching what notebook 3 (cell "Write the monitoring run")
+    # persists. The `drifted_features` list is filtered + top-5 capped for the
+    # SNS alert; using it here would drop non-drifted and beyond-top-5 features
+    # from the dashboard, so Lambda-generated runs would show a thinner feature
+    # set than notebook-generated ones. Iterate per_column instead.
     per_feature = {}
     if data_drift_result:
-        for feat_info in data_drift_result.get('drifted_features', []):
-            per_feature[feat_info['feature']] = feat_info.get('drift_score', 0)
+        for col, info in data_drift_result.get('per_column', {}).items():
+            per_feature[col] = {
+                'score': info.get('drift_score', 0),
+                'magnitude': info.get('drift_magnitude', 0),
+                'method': info.get('method', ''),
+                'threshold': info.get('threshold', 0),
+            }
 
     # Compute F1 from precision and recall if model drift available
     f1 = None

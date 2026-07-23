@@ -1072,6 +1072,24 @@ def create_feature_drift_detail_view(
 
     logger.info("Creating feature_drift_detail view...")
 
+    # Severity thresholds use `drift_magnitude` (test-agnostic × past
+    # threshold) rather than raw `drift_score` because Evidently auto-picks
+    # p-value tests (KS/Chi-square, lower=drift) for small samples and
+    # distance tests (Wasserstein/Jensen-Shannon, higher=drift) for large
+    # samples — raw score has opposite drift directions across features in
+    # the same run. drift_magnitude normalizes: 1.0 = at threshold,
+    # >1.0 = drifted, higher = more drifted, regardless of test.
+    #
+    # `per_feature_drift_scores` may hold two schemas depending on when the
+    # row was written:
+    #   * Legacy (pre-fix):  MAP<VARCHAR, DOUBLE>  → value is raw drift_score
+    #   * Current:           MAP<VARCHAR, JSON>    → value is
+    #                          {score, magnitude, method, threshold}
+    # drift_score COALESCEs both (a legacy scalar IS the raw score), but
+    # drift_magnitude deliberately has NO raw-score fallback: a legacy row
+    # yields NULL magnitude rather than mis-reading its raw score as a
+    # magnitude (which would resurrect the credit_limit false-drift bug —
+    # a high KS p-value is "not drifted" but would sort/plot as "most drifted").
     create_view_sql = f"""
 CREATE OR REPLACE VIEW {resolved_database}.{FEATURE_DRIFT_DETAIL_VIEW} AS
 SELECT
@@ -1089,30 +1107,21 @@ SELECT
     current_roc_auc,
     feature_name,
     COALESCE(
-        TRY(CAST(json_format(feature_value) AS DOUBLE)),
-        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.score') AS DOUBLE))
-    ) as drift_score,
-    COALESCE(
-        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
+        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.score') AS DOUBLE)),
         TRY(CAST(json_format(feature_value) AS DOUBLE))
-    ) as drift_magnitude,
+    ) as drift_score,
+    TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)) as drift_magnitude,
     TRY(json_extract_scalar(json_format(feature_value), '$.method')) as drift_method,
     TRY(CAST(json_extract_scalar(json_format(feature_value), '$.threshold') AS DOUBLE)) as drift_threshold,
     CASE
-        WHEN COALESCE(
-            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
-            TRY(CAST(json_format(feature_value) AS DOUBLE))
-        ) > 2.5 THEN 'Significant'
-        WHEN COALESCE(
-            TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
-            TRY(CAST(json_format(feature_value) AS DOUBLE))
-        ) > 1.0 THEN 'Moderate'
+        WHEN TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)) >= 3.0 THEN 'Significant'
+        WHEN TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)) >= 1.0 THEN 'Moderate'
         ELSE 'Low'
     END as drift_severity,
-    CASE WHEN COALESCE(
-        TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)),
-        TRY(CAST(json_format(feature_value) AS DOUBLE))
-    ) > 1.0 THEN true ELSE false END as drift_detected
+    CASE
+        WHEN TRY(CAST(json_extract_scalar(json_format(feature_value), '$.magnitude') AS DOUBLE)) >= 1.0 THEN true
+        ELSE false
+    END as drift_detected
 FROM {resolved_database}.monitoring_responses
 CROSS JOIN UNNEST(
     CAST(json_parse(per_feature_drift_scores) AS MAP(VARCHAR, JSON))
@@ -1283,6 +1292,9 @@ def create_feature_level_dataset(
                     {'Name': 'current_roc_auc', 'Type': 'DECIMAL'},
                     {'Name': 'feature_name', 'Type': 'STRING'},
                     {'Name': 'drift_score', 'Type': 'DECIMAL'},
+                    {'Name': 'drift_magnitude', 'Type': 'DECIMAL'},
+                    {'Name': 'drift_method', 'Type': 'STRING'},
+                    {'Name': 'drift_threshold', 'Type': 'DECIMAL'},
                     {'Name': 'drift_severity', 'Type': 'STRING'},
                     {'Name': 'drift_detected', 'Type': 'BIT'},
                 ],
@@ -2010,43 +2022,86 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     """
     Build the "Feature Drift Trends" tab (Sheet 3).
 
-    Answers "which specific features are drifting, over what time, and is
-    the drift consistent across model versions?" Bound to
-    `DS_IDENT_FEATURE_LEVEL` (the CustomSql view that unpacks the JSON
-    per_feature_drift_scores).
+    Answers "which specific features are drifting, how severely, and is it
+    consistent across model versions?" Bound to `DS_IDENT_FEATURE_LEVEL`
+    (the CustomSql view that unpacks the JSON per_feature_drift_scores).
+
+    ---
+    Metric convention (READ THIS BEFORE CHANGING ANY VISUAL)
+
+    Evidently auto-selects a statistical test per column based on sample
+    size, so raw `drift_score` semantics change per row:
+      * K-S / Chi-square p-value (small samples)  → LOWER  = more drift
+      * Wasserstein / Jensen-Shannon (n ≥ 1000)   → HIGHER = more drift
+
+    Consequence: aggregating `drift_score` (AVG / MAX) across features
+    mixes opposite-direction scales and produces nonsense.
+
+    Aggregate visuals here use `drift_magnitude` instead — a test-agnostic
+    "× past threshold" number where 1.0 = at threshold, ≥ 1.0 = drifted,
+    higher = more drifted, regardless of test.
+
+    Raw `drift_score` is shown ONLY in visuals filtered to a single
+    test-family (F10 for p-values, F11 for distances) or alongside
+    `drift_method` in the raw detail table (F5).
+    ---
 
     Visuals:
-        F1  Feature Drift Score Timeline               (line, per-feature)
-        F2  Top 15 Most-Drifting Features (all time)   (horizontal bar)
-        F3  Drift Severity by Feature (Top 15)         (stacked bar)
-        F4  Feature Drift Heatmap (Features × Time)    (pivot)
-        F5  Feature Drift Details                      (lookup table)
-        F6  Highest Current Drift Score                (KPI)
-        F7  Feature Drift Heatmap (Features × Version) (pivot — cross-model consistency)
+      Primary — drift_magnitude (test-agnostic, higher = more drift):
+        F1  Feature Drift Magnitude Timeline           (line, per-feature)
+        F2  Top 15 Drifted Features by Magnitude       (horizontal bar)
+        F4  Feature Drift Magnitude Heatmap (× Time)   (pivot)
+        F6  Highest Current Drift Magnitude            (KPI)
+        F7  Feature Drift Magnitude by Model Version   (pivot)
+        F8  Max Feature Drift Magnitude Per Run        (line)
+
+      Severity + occurrence (categorical, direction-independent):
+        F3  Drift Severity Distribution by Feature     (stacked bar)
+        F9  Repeat-Offender Features                   (horizontal bar)
+
+      Raw drift_score examples (split by test direction, clearly labeled):
+        F10 Raw p-values (lower = more drift)          (line, KS/Chi-square only)
+        F11 Raw distances (higher = more drift)        (line, Wasserstein/JS only)
+
+      Raw detail:
+        F5  Feature Drift Details                      (table — score + magnitude + method)
     """
     def flcol(name):
         return {'DataSetIdentifier': DS_IDENT_FEATURE_LEVEL, 'ColumnName': name}
 
-    # Reference line at magnitude = 1.0 (drifted threshold: magnitude >= 1.0 means drifted)
+    # Reference line at magnitude = 1.0 (the drift threshold). Anything above
+    # this line means the feature crossed its test-specific threshold —
+    # regardless of which test Evidently picked.
     magnitude_ref_line_1 = [{
         'Status': 'ENABLED',
-        'DataConfiguration': {'StaticConfiguration': {'Value': 1.0}, 'AxisBinding': 'PRIMARY_YAXIS'},
-        'StyleConfiguration': {'Pattern': 'DASHED', 'Color': '#C00000'},
+        'DataConfiguration': {
+            'StaticConfiguration': {'Value': 1.0},
+            'AxisBinding': 'PRIMARY_YAXIS',
+        },
+        'StyleConfiguration': {
+            'Pattern': 'DASHED',
+            'Color': '#C00000',
+        },
         'LabelConfiguration': {
-            'CustomLabelConfiguration': {'CustomLabel': 'magnitude = 1.0 (above = drifted)'},
+            'CustomLabelConfiguration': {'CustomLabel': 'Drift threshold (magnitude = 1.0)'},
             'FontConfiguration': {'FontSize': {'Relative': 'SMALL'}},
+            'HorizontalPosition': 'RIGHT',
+            'VerticalPosition': 'ABOVE',
         },
     }]
 
-    f1_score_timeline = {
+    # ─── Primary: drift_magnitude (test-agnostic, higher = more drift) ────
+
+    f1_magnitude_timeline = {
         'LineChartVisual': {
-            'VisualId': 'f1-feature-drift-timeline',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Feature Drift Score Timeline'}},
+            'VisualId': 'f1-magnitude-timeline',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Feature Drift Magnitude Timeline (x threshold - higher = more drift, test-agnostic)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'LineChartAggregatedFieldWells': {
                         'Category': [{'DateDimensionField': {'FieldId': 'f1-date', 'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'DAY'}}],
-                        'Values':   [{'NumericalMeasureField': {'FieldId': 'f1-score', 'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
+                        'Values':   [{'NumericalMeasureField': {'FieldId': 'f1-mag', 'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
                         'Colors':   [{'CategoricalDimensionField': {'FieldId': 'f1-feat', 'Column': flcol('feature_name')}}],
                     }
                 },
@@ -2060,19 +2115,21 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
         }
     }
 
-    f2_top_features = {
+    f2_top_features_by_magnitude = {
         'BarChartVisual': {
-            'VisualId': 'f2-top-features',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Top 15 Most-Drifting Features (All Time)'}},
+            'VisualId': 'f2-top-features-magnitude',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Top 15 Drifted Features (AVG magnitude, all time - higher = more drift)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'BarChartAggregatedFieldWells': {
                         'Category': [{'CategoricalDimensionField': {'FieldId': 'f2-feat', 'Column': flcol('feature_name')}}],
-                        'Values':   [{'NumericalMeasureField':    {'FieldId': 'f2-avg',  'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
+                        'Values':   [{'NumericalMeasureField':    {'FieldId': 'f2-avg',  'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
                     }
                 },
                 'Orientation': 'HORIZONTAL',
                 'CategoryLabelOptions': {'Visibility': 'VISIBLE'},
+                'ReferenceLines': magnitude_ref_line_1,
             }
         }
     }
@@ -2080,12 +2137,13 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     f3_severity_by_feature = {
         'BarChartVisual': {
             'VisualId': 'f3-severity-by-feature',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Drift Severity Distribution by Feature (Top 15)'}},
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Drift Severity Distribution by Feature (bands: Low <1.0, Moderate >=1.0, Significant >=3.0)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'BarChartAggregatedFieldWells': {
                         'Category': [{'CategoricalDimensionField': {'FieldId': 'f3-feat', 'Column': flcol('feature_name')}}],
-                        'Values':   [{'NumericalMeasureField':    {'FieldId': 'f3-cnt',  'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'COUNT'}}}],
+                        'Values':   [{'NumericalMeasureField':    {'FieldId': 'f3-cnt',  'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'COUNT'}}}],
                         'Colors':   [{'CategoricalDimensionField': {'FieldId': 'f3-sev', 'Column': flcol('drift_severity')}}],
                     }
                 },
@@ -2095,37 +2153,45 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
         }
     }
 
-    f4_heatmap_time = {
+    f4_magnitude_heatmap_time = {
         'PivotTableVisual': {
-            'VisualId': 'f4-heatmap-time',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Feature Drift Heatmap (Features × Time)'}},
+            'VisualId': 'f4-magnitude-heatmap-time',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Feature Drift Magnitude Heatmap (Features x Time - cells >=1.0 are drifted)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'PivotTableAggregatedFieldWells': {
                         'Rows':    [{'CategoricalDimensionField': {'FieldId': 'f4-feat', 'Column': flcol('feature_name')}}],
                         'Columns': [{'DateDimensionField':        {'FieldId': 'f4-date', 'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'DAY'}}],
-                        'Values':  [{'NumericalMeasureField':    {'FieldId': 'f4-val',  'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
+                        'Values':  [{'NumericalMeasureField':    {'FieldId': 'f4-val',  'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
                     }
                 }
             }
         }
     }
 
+    # F5 — Raw details table. Shows BOTH score and magnitude alongside the
+    # test method so a human can see the test-specific number AND the
+    # normalized "× threshold" number in one row. This is the only place
+    # raw `drift_score` and `drift_magnitude` appear side-by-side.
     f5_details_table = {
         'TableVisual': {
             'VisualId': 'f5-details-table',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Feature Drift Details (per run × feature)'}},
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Feature Drift Details - raw score + normalized magnitude + which test Evidently used'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'TableAggregatedFieldWells': {
                         'GroupBy': [
-                            {'DateDimensionField':        {'FieldId': 'f5-ts',    'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'MINUTE'}},
-                            {'CategoricalDimensionField': {'FieldId': 'f5-feat',  'Column': flcol('feature_name')}},
-                            {'CategoricalDimensionField': {'FieldId': 'f5-sev',   'Column': flcol('drift_severity')}},
-                            {'CategoricalDimensionField': {'FieldId': 'f5-mv',    'Column': flcol('model_version')}},
+                            {'DateDimensionField':        {'FieldId': 'f5-ts',     'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'MINUTE'}},
+                            {'CategoricalDimensionField': {'FieldId': 'f5-feat',   'Column': flcol('feature_name')}},
+                            {'CategoricalDimensionField': {'FieldId': 'f5-method', 'Column': flcol('drift_method')}},
+                            {'CategoricalDimensionField': {'FieldId': 'f5-sev',    'Column': flcol('drift_severity')}},
+                            {'CategoricalDimensionField': {'FieldId': 'f5-mv',     'Column': flcol('model_version')}},
                         ],
                         'Values': [
-                            {'NumericalMeasureField': {'FieldId': 'f5-score', 'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
+                            {'NumericalMeasureField': {'FieldId': 'f5-score', 'Column': flcol('drift_score'),     'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
+                            {'NumericalMeasureField': {'FieldId': 'f5-mag',   'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}},
                         ],
                     }
                 }
@@ -2133,56 +2199,58 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
         }
     }
 
-    f6_highest_score = {
+    f6_highest_magnitude = {
         'KPIVisual': {
-            'VisualId': 'f6-highest-score',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Highest Current Drift Score'}},
+            'VisualId': 'f6-highest-magnitude',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Highest Drift Magnitude (worst feature x threshold - higher = more drift)'}},
             'ChartConfiguration': {
                 'FieldWells': {
-                    'Values': [{'NumericalMeasureField': {'FieldId': 'f6-val', 'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'MAX'}}}],
+                    'Values': [{'NumericalMeasureField': {'FieldId': 'f6-val', 'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'MAX'}}}],
                     'TrendGroups': [{'DateDimensionField': {'FieldId': 'f6-trend', 'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'DAY'}}],
                 }
             }
         }
     }
 
-    # F7 — new. Cross-model-version heatmap. Row = feature, column =
-    # model_version, cell = AVG drift score. Answers "is this feature
-    # drifting consistently across our retrained models, or is it a
-    # symptom of one specific version's training data?"
-    f7_heatmap_version = {
+    # F7 — Cross-model-version heatmap using magnitude. Answers "is this
+    # feature drifting consistently across our retrained models, or is it
+    # a symptom of one specific version's training data?"
+    f7_magnitude_heatmap_version = {
         'PivotTableVisual': {
-            'VisualId': 'f7-heatmap-version',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Feature Drift Heatmap (Features × Model Version)'}},
+            'VisualId': 'f7-magnitude-heatmap-version',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Feature Drift Magnitude by Model Version (consistent across versions = systemic; one-version-only = training-data issue)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'PivotTableAggregatedFieldWells': {
                         'Rows':    [{'CategoricalDimensionField': {'FieldId': 'f7-feat', 'Column': flcol('feature_name')}}],
                         'Columns': [{'CategoricalDimensionField': {'FieldId': 'f7-mv',   'Column': flcol('model_version')}}],
-                        'Values':  [{'NumericalMeasureField':    {'FieldId': 'f7-val',  'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
+                        'Values':  [{'NumericalMeasureField':    {'FieldId': 'f7-val',  'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'AVERAGE'}}}],
                     }
                 }
             }
         }
     }
 
-    # F8 — Max Feature Drift Score Per Run. The *worst* feature per run is
-    # more actionable than the AVG shown on Sheet 2 (D1): a moderate average
-    # drift can hide a single feature that shifted catastrophically. This
-    # visual highlights the peak — the feature that would trigger the
-    # loudest alert — and its trend over monitoring runs.
-    f8_max_drift_per_run = {
+    # F8 — Max magnitude per run. The peak feature per run is more actionable
+    # than the average: a moderate average can hide a single feature that
+    # shifted catastrophically. Spikes on this chart = the feature that would
+    # have triggered the loudest alert.
+    f8_max_magnitude_per_run = {
         'LineChartVisual': {
-            'VisualId': 'f8-max-drift-per-run',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Max Feature Drift Score Per Run (worst-feature signal)'}},
+            'VisualId': 'f8-max-magnitude-per-run',
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Max Feature Drift Magnitude Per Run (worst-feature signal - spikes = catastrophic shift)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'LineChartAggregatedFieldWells': {
                         'Category': [{'DateDimensionField': {'FieldId': 'f8-date', 'Column': flcol('monitoring_timestamp'), 'DateGranularity': 'DAY'}}],
-                        'Values':   [{'NumericalMeasureField': {'FieldId': 'f8-max', 'Column': flcol('drift_score'), 'AggregationFunction': {'SimpleNumericalAggregation': 'MAX'}}}],
+                        'Values':   [{'NumericalMeasureField': {'FieldId': 'f8-max', 'Column': flcol('drift_magnitude'), 'AggregationFunction': {'SimpleNumericalAggregation': 'MAX'}}}],
                         'Colors':   [{'CategoricalDimensionField': {'FieldId': 'f8-mv', 'Column': flcol('model_version')}}],
                     }
-                }
+                },
+                'ReferenceLines': magnitude_ref_line_1,
             }
         }
     }
@@ -2191,12 +2259,11 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     # flagged as drifted (drift_detected = TRUE). Answers "which features
     # drift chronically vs. one-off spikes?" — chronic drifters are usually
     # retraining candidates; one-off spikes are usually data-quality issues.
-    # Different granularity than F2 (which averages the score); this one
-    # counts flagged occurrences.
     f9_repeat_offenders = {
         'BarChartVisual': {
             'VisualId': 'f9-repeat-offenders',
-            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText': 'Repeat-Offender Features (# of runs where drift_detected=TRUE)'}},
+            'Title': {'Visibility': 'VISIBLE', 'FormatText': {'PlainText':
+                'Repeat-Offender Features (# runs where drift_detected=TRUE - chronic drifters, retraining candidates)'}},
             'ChartConfiguration': {
                 'FieldWells': {
                     'BarChartAggregatedFieldWells': {
@@ -2274,18 +2341,18 @@ def build_feature_drift_visuals() -> List[Dict[str, Any]]:
     }
 
     return [
-        f1_score_timeline,
-        f2_top_features,
+        f1_magnitude_timeline,
+        f2_top_features_by_magnitude,
         f3_severity_by_feature,
-        f4_heatmap_time,
+        f4_magnitude_heatmap_time,
         f5_details_table,
-        f6_highest_score,
-        f7_heatmap_version,
-        f8_max_drift_per_run,
+        f6_highest_magnitude,
+        f7_magnitude_heatmap_version,
+        f8_max_magnitude_per_run,
         f9_repeat_offenders,
+        f10_raw_pvalue_timeline,
+        f11_raw_distance_timeline,
     ]
-
-
 
 
 def _build_all_visuals() -> Dict[str, List[Dict[str, Any]]]:
@@ -2340,6 +2407,72 @@ def _build_definition(
     Returns:
         A Definition dict with DataSetIdentifierDeclarations + 3 Sheets.
     """
+    # Feature Drift sheet needs two visual-scoped filters to keep raw-score
+    # visuals honest:
+    #   * F10 (Raw p-values)  → show ONLY rows where drift_method contains
+    #                           "p_value" (KS, Chi-square)
+    #   * F11 (Raw distances) → show ONLY rows where drift_method contains
+    #                           "distance" (Wasserstein, Jensen-Shannon)
+    # Without these filters, F10/F11 would average p-values with distances
+    # and mislead the reader — exactly the problem drift_magnitude solves,
+    # but for the "raw score" visuals we split the data instead.
+    feature_sheet_filter_groups = [
+        {
+            'FilterGroupId': 'fg-f10-pvalue-only',
+            'Filters': [{
+                'CategoryFilter': {
+                    'FilterId': 'f-f10-method-pvalue',
+                    'Column': {'DataSetIdentifier': DS_IDENT_FEATURE_LEVEL, 'ColumnName': 'drift_method'},
+                    'Configuration': {
+                        'CustomFilterConfiguration': {
+                            'MatchOperator': 'CONTAINS',
+                            'NullOption': 'NON_NULLS_ONLY',
+                            'CategoryValue': 'p_value',
+                        }
+                    },
+                }
+            }],
+            'ScopeConfiguration': {
+                'SelectedSheets': {
+                    'SheetVisualScopingConfigurations': [{
+                        'SheetId': 'governance-sheet-feature',
+                        'Scope': 'SELECTED_VISUALS',
+                        'VisualIds': ['f10-raw-pvalue-timeline'],
+                    }]
+                }
+            },
+            'Status': 'ENABLED',
+            'CrossDataset': 'SINGLE_DATASET',
+        },
+        {
+            'FilterGroupId': 'fg-f11-distance-only',
+            'Filters': [{
+                'CategoryFilter': {
+                    'FilterId': 'f-f11-method-distance',
+                    'Column': {'DataSetIdentifier': DS_IDENT_FEATURE_LEVEL, 'ColumnName': 'drift_method'},
+                    'Configuration': {
+                        'CustomFilterConfiguration': {
+                            'MatchOperator': 'CONTAINS',
+                            'NullOption': 'NON_NULLS_ONLY',
+                            'CategoryValue': 'distance',
+                        }
+                    },
+                }
+            }],
+            'ScopeConfiguration': {
+                'SelectedSheets': {
+                    'SheetVisualScopingConfigurations': [{
+                        'SheetId': 'governance-sheet-feature',
+                        'Scope': 'SELECTED_VISUALS',
+                        'VisualIds': ['f11-raw-distance-timeline'],
+                    }]
+                }
+            },
+            'Status': 'ENABLED',
+            'CrossDataset': 'SINGLE_DATASET',
+        },
+    ]
+
     return {
         'DataSetIdentifierDeclarations': [
             {'Identifier': DS_IDENT_INFERENCE, 'DataSetArn': dataset_arns['inference']},
@@ -2353,6 +2486,7 @@ def _build_definition(
             {'SheetId': 'governance-sheet-data',    'Name': 'Data Drift Trends',    'Visuals': visuals['sheet2']},
             {'SheetId': 'governance-sheet-feature', 'Name': 'Feature Drift Trends', 'Visuals': visuals['sheet3']},
         ],
+        'FilterGroups': feature_sheet_filter_groups,
     }
 
 
