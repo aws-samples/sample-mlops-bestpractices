@@ -1,6 +1,8 @@
 # Automated Drift and Trend Monitoring for ML Models on Amazon SageMaker
 
-End-to-end MLOps reference architecture for credit card fraud detection with automated drift detection, ground truth integration, and governance dashboard. Built on SageMaker Pipelines, MLflow, Evidently AI, and QuickSight.
+End-to-end MLOps reference architecture for bank marketing subscription prediction with automated drift detection, ground truth integration, and governance dashboard. Built on SageMaker Pipelines, MLflow, Evidently AI, and QuickSight.
+
+> **Dataset-agnostic**: This branch defaults to the UCI Bank Marketing dataset but supports any tabular binary classification dataset via config-only changes. See [Bring Your Own Dataset](#bring-your-own-dataset).
 
 ## Architecture
 
@@ -12,7 +14,7 @@ See [ARCHITECTURE_STEPS.md](docs/ARCHITECTURE_STEPS.md) for detailed step-by-ste
 
 ### Step 1: Deploy the CloudFormation Stack
 
-Provisions everything: SageMaker domain, user profile, JupyterLab space, **SageMaker MLflow App (serverless)** for experiment tracking, S3 bucket, VPC, SQS queue, Lambda inference logger, and IAM role with all required permissions. On first space launch, the lifecycle script clones this repo, downloads the Kaggle training data, uploads to S3, creates Athena tables, and writes a populated `.env` file (including the MLflow App ARN).
+Provisions everything: SageMaker domain, user profile, JupyterLab space, **SageMaker MLflow App (serverless)** for experiment tracking, S3 bucket, VPC, SQS queue, Lambda inference logger, and IAM role with all required permissions. On first space launch, the lifecycle script clones this repo, downloads the UCI Bank Marketing training data, preprocesses it, uploads to S3, creates Athena tables, and writes a populated `.env` file (including the MLflow App ARN).
 
 ```bash
 ./cloudformation/deploy-main-stack.sh                           # default: fraud-detection-monitoring in us-west-2
@@ -546,10 +548,10 @@ sagemaker-automated-drift-and-trend-monitoring/
 │   ├── train_pipeline/                # Pipeline definition + preprocessing/training/evaluation steps
 │   ├── drift_monitoring/              # Drift detection Lambdas, ground truth utilities, Evidently wrappers
 │   ├── governance/                    # QuickSight dashboard provisioning
-│   ├── setup/                         # IAM role + infrastructure helpers, Kaggle dataset downloader (download_kaggle_dataset.py)
+│   ├── setup/                         # IAM role + infrastructure helpers, dataset preprocessor (prepare_dataset.py), Bank Marketing downloader (download_dataset.py)
 │   ├── config/                        # config.py + config.yaml (drift thresholds, simulation params)
 │   └── utils/                         # AWS session, MLflow, visualization helpers
-├── data/                              # Local CSVs (gitignored; populated at runtime by Kaggle download / drift generator)
+├── data/                              # Local CSVs (gitignored; populated at runtime by download/prepare scripts + drift generator)
 ├── docs/
 │   ├── ARCHITECTURE_STEPS.md          # 11-step architecture walkthrough
 │   ├── VERSION_MANAGEMENT.md          # MLflow model versioning guide
@@ -856,7 +858,7 @@ In QuickSight, both datasets expose `monitoring_run_id` — drop it into a filte
 
 | Table | Type | Purpose |
 |-------|------|---------|
-| `training_data` | Iceberg | Training features (~80% of Kaggle rows; feature set defined in `src/config/dataset_schema.yaml`). Populated by the `SeedAthenaTrainingData` pipeline step. Also serves as the **data-drift baseline** (time-travelled via `training_snapshot_id`). |
+| `training_data` | Iceberg | Training features (~80% of dataset rows; feature set defined in `src/config/dataset_schema.yaml`). Populated by the `SeedAthenaTrainingData` pipeline step. Also serves as the **data-drift baseline** (time-travelled via `training_snapshot_id`). |
 | `evaluation_data` | Iceberg | Held-out evaluation slice (~20%, same hash split). Read by preprocessing for the test channel and by the drift monitor as the **model-drift baseline** (time-travelled via `evaluation_snapshot_id`) — its `is_fraud` + `fraud_prediction` columns let the monitor compare current performance to the model's scored test set. |
 | `inference_responses` | Iceberg | All endpoint predictions, partitioned by day. `ground_truth` column populated via MERGE from `ground_truth_updates`. `monitoring_run_id` column backfilled by each drift run so QuickSight can join with `monitoring_responses` to show "which predictions this run measured". |
 | `ground_truth_updates` | Iceberg | Lightweight patches: `inference_id` + `actual_fraud` + confirmation metadata |
@@ -917,7 +919,7 @@ ATHENA_EVALUATION_TABLE=your_eval_table
 
 **Notebook path (Notebook 1):**
 1. Update `.env` and `dataset_schema.yaml` first.
-2. Skip the "Download Kaggle dataset" cell — your data doesn't come from Kaggle.
+2. Skip the "Download dataset" cell if your data is already available — your data doesn't come from UCI.
 3. Run the remaining cells normally. The pipeline's seed step (`SeedAthenaTrainingData`) starts with an integrity check; when it sees both tables already exist with rows matching the schema, it **skips seeding** and no data is overwritten. Preprocessing then reads directly from your tables via the pipeline parameters, and every downstream step (training, drift, dashboards) picks up your schema automatically.
 4. **Do NOT run** `python main.py setup --force-recreate` in this route — it would DROP/CREATE the tables named in your env vars.
 
@@ -941,7 +943,7 @@ df = df[schema.csv_column_order()]   # required — reorder before writing
 df.to_csv(dest, index=False)
 ```
 
-`src/setup/download_kaggle_dataset.py` is the reference implementation — it renames Kaggle's source columns to schema names and reorders before uploading to S3. The seed step then `INSERT ... SELECT`s it into the Iceberg `training_data` + `evaluation_data` tables. Adapt it or write your own loader.
+`src/setup/prepare_dataset.py` is the config-driven preprocessor — it renames columns, label-encodes categoricals, generates synthetic identifier/timestamp/prediction columns, and reorders to `schema.csv_column_order()`, all driven by the `preprocessing` section in `config.yaml`. For BYO datasets, update config — no code changes needed. The seed step then `INSERT ... SELECT`s it into the Iceberg `training_data` + `evaluation_data` tables.
 
 In all three routes: the CSV format is a convenience for the reference dataset, not a requirement. Athena Iceberg is the durable storage layer and every downstream consumer (training, drift Lambda, QuickSight) reads from Athena, not from S3 files.
 
@@ -1038,7 +1040,7 @@ The suite covers three layers:
 
 - **Schema and BYO-dataset invariants** — `test_schema_accessors`, `test_schema_error_handling`, `test_dataset_schema_yaml`, `test_config_cleanup`, `test_target_column_defaults`. Guarantee that editing `dataset_schema.yaml` propagates correctly to every downstream step (Athena DDL, seed step, training args, drift Lambda) without touching Python code.
 - **CLI-invocable surface** — `test_deploy_endpoint`, `test_manage_drift_lambda`. Smoke-test the modules that back `main.py deploy` and `main.py monitoring` — happy path, one error path, idempotency. (`main.py dashboard` is currently only covered by end-to-end runs against a live QuickSight account; the module's shape has diverged from its previous unit tests and hasn't been re-covered yet.)
-- **Generated / bundled artifacts** — `test_create_athena_tables_*`, `test_seed_athena_tables_*`, `test_validate_dataset_schema_*`, `test_pipeline_bundling`, `test_lambda_drift_monitor_schema`, `test_scheduled_job_column_generation`, `test_download_kaggle_dataset`, `test_version_validation`. Cover code paths that produce artifacts the user doesn't see until they hit AWS (Athena DDL strings, INSERT column ordering, Lambda source spliced from a template).
+- **Generated / bundled artifacts** — `test_create_athena_tables_*`, `test_seed_athena_tables_*`, `test_validate_dataset_schema_*`, `test_pipeline_bundling`, `test_lambda_drift_monitor_schema`, `test_scheduled_job_column_generation`, `test_version_validation`. Cover code paths that produce artifacts the user doesn't see until they hit AWS (Athena DDL strings, INSERT column ordering, Lambda source spliced from a template).
 
 **Extending the suite** — when you add a new CLI subcommand or a new AWS-touching module, copy the pattern in `test_deploy_endpoint.py`: build a `MagicMock` boto3 client, exercise the happy path, one error path, and one idempotency case. Keep tests boring; skip anything you can't explain the value of.
 
@@ -1052,7 +1054,7 @@ The lifecycle script downloads training data, uploads to S3, and creates Athena 
 cd ~/sample-mlops-bestpractices/sagemaker-automated-drift-and-trend-monitoring
 source .env
 uv pip install --system -e .   # same install command notebook 1 cell 2 uses
-python -m src.setup.download_kaggle_dataset
+python -m src.setup.download_dataset
 python -m src.setup.upload_data_to_s3
 python -m src.setup.create_athena_tables
 ```
