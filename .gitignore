@@ -19,6 +19,7 @@ __pycache__/
 
 # Large data files — upload to S3 via src/setup/upload_data_to_s3.py
 sagemaker-automated-drift-and-trend-monitoring/data/*.csv
+sagemaker-automated-drift-and-trend-monitoring/data/raw/*.csv
 # Generated synthetic datasets (from data/generate_datasets.py)
 sagemaker-automated-drift-and-trend-monitoring/data/generated_*.csv
 .Python

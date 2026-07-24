@@ -10,17 +10,20 @@
 # To bring your own dataset:
 #   1. Edit this file: identifier_column, target_column, and the full
 #      `features` list (name + type) for YOUR data.
-#   2. Update config.yaml: set `data.csv_training_data` to your CSV filename,
-#      tune `training.xgboost_params` for your class balance, and update
-#      `drift_generation.default_drift` feature names.
-#   3. Place your pre-processed CSV in the `data/` directory (columns must
-#      match the order: identifier + features + auxiliary_columns + target).
-#   4. Upload to S3:  python -m src.setup.upload_data_to_s3
-#   5. Recreate the Athena tables against the new schema:
+#   2. Update config.yaml:
+#      - `preprocessing` section: column_rename_map, categorical_columns,
+#        target_transform (source_column + positive_value), identifier prefix.
+#      - `data.csv_training_data`: output CSV filename.
+#      - `training.xgboost_params`: tune for your class balance.
+#      - `drift_generation.default_drift`: update feature names.
+#   3. Place your raw CSV in `data/raw/` and set `preprocessing.raw_input_csv`.
+#   4. Run:  python -m src.setup.prepare_dataset
+#      (preprocesses raw CSV → pipeline-ready output in data/)
+#   5. Upload to S3:  python -m src.setup.upload_data_to_s3
+#   6. Recreate the Athena tables:
 #         ./cloudformation/deploy-stack.sh --recreate-database
-#   6. Validate before spending SageMaker $$:
-#         python -m src.setup.validate_dataset_schema
-#   7. Run the training pipeline. No other code changes needed.
+#   7. Validate:  python -m src.setup.validate_dataset_schema
+#   8. Run the training pipeline. No code changes needed.
 #
 # Supported `type` values: double, string, boolean, int, timestamp
 # (must map onto Athena/Iceberg SQL types — see schema.py ATHENA_TYPE_MAP).

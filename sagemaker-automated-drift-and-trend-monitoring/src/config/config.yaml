@@ -202,6 +202,65 @@ data:
   s3_drifted_data: ""
 
 # ---------------------------------------------------------------------------
+# Preprocessing (used by src/setup/prepare_dataset.py)
+# ---------------------------------------------------------------------------
+# Config-driven preprocessing: transforms a raw CSV into the pipeline-ready
+# format. BYO-dataset users update this section — no code changes needed.
+#
+# Default below: UCI Bank Marketing dataset (bank-additional-full.csv).
+preprocessing:
+  # Path to the raw input CSV (relative to project root)
+  raw_input_csv: "data/raw/bank-additional-full.csv"
+
+  # Column renaming: raw_source_name → schema_name
+  # Applied before any other transformation.
+  column_rename_map:
+    "default": "credit_default"
+    "emp.var.rate": "emp_var_rate"
+    "cons.price.idx": "cons_price_idx"
+    "cons.conf.idx": "cons_conf_idx"
+    "nr.employed": "nr_employed"
+
+  # Categorical columns to label-encode (use schema-side names, i.e. AFTER rename).
+  # Each column's unique string values are mapped to integers 0..N-1.
+  categorical_columns:
+    - job
+    - marital
+    - education
+    - credit_default
+    - housing
+    - loan
+    - contact
+    - month
+    - day_of_week
+    - poutcome
+
+  # Target column transformation.
+  # source_column: the raw column name that contains the label.
+  # positive_value: the string value that maps to True (all others → False).
+  target_transform:
+    source_column: "y"
+    positive_value: "yes"
+
+  # Identifier column generation (if not present in raw data).
+  identifier:
+    generate: true
+    prefix: "bm-"
+
+  # Timestamp column generation (if not present in raw data).
+  timestamp:
+    generate: true
+    lookback_days: 730          # random timestamps within last N days
+
+  # Synthetic prediction/probability columns (for pipeline seeding).
+  predictions:
+    generate: true
+    positive_probability_low: 0.50
+    positive_probability_high: 0.99
+    negative_probability_low: 0.01
+    negative_probability_high: 0.40
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 # Target column, feature list, and column-rename map live in code, not here —
