@@ -42,7 +42,9 @@ from src.config.config import (  # noqa: E402
     DATA_S3_BUCKET,
     DATA_S3_PREFIX,
 )
-from src.config import schema  # noqa: E402
+# NOTE: This script does NOT import src.config.schema because the live
+# dataset_schema.yaml may point to a different dataset (e.g. Bank Marketing).
+# Instead, the credit-card column order is defined inline below.
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -103,12 +105,30 @@ KAGGLE_COLUMN_MAP = {
     "Class": "is_fraud",
 }
 
-# Canonical column order for creditcard_predictions_final.csv, driven by
-# dataset_schema.yaml via src.config.schema. The pipeline seed step
-# (seed_athena_tables.py) uses this exact same order to declare its
-# staging table — both derive it from the same source, so they can never
-# drift apart.
-CSV_COLUMN_ORDER = schema.csv_column_order()
+# Canonical column order for creditcard_predictions_final.csv. This is
+# self-contained (not read from dataset_schema.yaml) so this script works
+# regardless of which dataset the live schema points to. When using this
+# downloader, switch dataset_schema.yaml to the credit-card schema.
+CSV_COLUMN_ORDER = [
+    # identifier
+    "transaction_id",
+    # features (order matches the credit-card dataset_schema.yaml)
+    "transaction_hour", "transaction_day_of_week", "transaction_amount",
+    "transaction_type_code", "customer_age", "customer_gender",
+    "customer_tenure_months", "account_age_days", "distance_from_home_km",
+    "distance_from_last_transaction_km", "time_since_last_transaction_min",
+    "online_transaction", "international_transaction", "high_risk_country",
+    "merchant_category_code", "merchant_reputation_score", "chip_transaction",
+    "pin_used", "card_present", "cvv_match", "address_verification_match",
+    "num_transactions_24h", "num_transactions_7days",
+    "avg_transaction_amount_30days", "max_transaction_amount_30days",
+    "velocity_score", "recurring_transaction", "previous_fraud_incidents",
+    "credit_limit", "available_credit_ratio",
+    # auxiliary columns
+    "fraud_prediction", "fraud_probability",
+    # target
+    "is_fraud",
+]
 
 
 # ---------------------------------------------------------------------------
