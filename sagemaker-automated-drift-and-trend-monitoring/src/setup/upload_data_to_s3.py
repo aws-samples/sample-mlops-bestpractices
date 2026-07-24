@@ -4,10 +4,13 @@ Upload local CSV data files to S3.
 This script uploads the CSV files from the local data/ directory to S3 so they
 can be loaded into Athena Iceberg tables without committing large files to git.
 
+Dataset-agnostic: the CSV filename is read from config.yaml (data.csv_training_data),
+so BYO-dataset users only need to update config — no code changes required.
+
 Usage:
     python -m src.setup.upload_data_to_s3
     python -m src.setup.upload_data_to_s3 --dry-run
-    python -m src.setup.upload_data_to_s3 --file data/creditcard_predictions_final.csv
+    python -m src.setup.upload_data_to_s3 --file data/my_custom_dataset.csv
 """
 
 import argparse
@@ -23,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.config.config import (
     AWS_DEFAULT_REGION,
+    CSV_TRAINING_DATA,
     DATA_DIR,
     DATA_S3_BUCKET,
     DATA_S3_PREFIX,
@@ -34,9 +38,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Mapping of local CSV filenames to their S3 sub-paths under the prefix
+# Derive the CSV filename and S3 mapping from config (not hardcoded).
+# CSV_TRAINING_DATA is a Path like /project/data/bank_marketing_predictions_final.csv
+_TRAINING_CSV_NAME = CSV_TRAINING_DATA.name
 CSV_S3_MAPPING = {
-    "creditcard_predictions_final.csv": "data/creditcard_predictions_final.csv",
+    _TRAINING_CSV_NAME: f"data/{_TRAINING_CSV_NAME}",
 }
 
 
@@ -84,15 +90,25 @@ def upload_all(bucket: str, prefix: str, data_dir: Path, dry_run: bool = False, 
     files_to_upload = CSV_S3_MAPPING
     if single_file:
         name = Path(single_file).name
+        # For --file, allow any filename (not just the one from config)
         if name not in CSV_S3_MAPPING:
-            logger.error(f"Unknown file: {name}. Expected one of {list(CSV_S3_MAPPING.keys())}")
-            return {}
-        files_to_upload = {name: CSV_S3_MAPPING[name]}
+            files_to_upload = {name: f"data/{name}"}
+        else:
+            files_to_upload = {name: CSV_S3_MAPPING[name]}
 
     for filename, s3_subpath in files_to_upload.items():
         local_path = data_dir / filename
         s3_key = f"{prefix}{s3_subpath}"
         results[filename] = upload_file(s3_client, local_path, bucket, s3_key, dry_run)
+
+    # Also upload to the predictions/data.csv key (pipeline seed step reads from here)
+    if not single_file:
+        predictions_key = f"{prefix}data/predictions/data.csv"
+        local_path = data_dir / _TRAINING_CSV_NAME
+        if local_path.exists():
+            results["predictions/data.csv"] = upload_file(
+                s3_client, local_path, bucket, predictions_key, dry_run
+            )
 
     uploaded = sum(1 for v in results.values() if v)
     logger.info(f"\nSummary: {uploaded}/{len(results)} files {'would be ' if dry_run else ''}uploaded to s3://{bucket}/{prefix}data/")
@@ -102,7 +118,7 @@ def upload_all(bucket: str, prefix: str, data_dir: Path, dry_run: bool = False, 
 def main():
     parser = argparse.ArgumentParser(description="Upload CSV data files to S3")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be uploaded without uploading")
-    parser.add_argument("--file", type=str, default=None, help="Upload a single file (e.g. data/creditcard_predictions_final.csv)")
+    parser.add_argument("--file", type=str, default=None, help="Upload a single file (e.g. data/my_dataset.csv)")
     parser.add_argument("--bucket", type=str, default=None, help="Override S3 bucket name")
     parser.add_argument("--prefix", type=str, default=None, help="Override S3 prefix")
     args = parser.parse_args()

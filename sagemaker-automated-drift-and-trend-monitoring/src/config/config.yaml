@@ -211,6 +211,8 @@ data:
 #   - Dataset download/transform → src/setup/download_dataset.py
 # Only XGBoost hyperparameters live in this section because they're tunable
 # without re-deriving the dataset.
+# For BYO datasets: place your pre-processed CSV in data/, update
+# `data.csv_training_data` above, and run `python -m src.setup.upload_data_to_s3`.
 training:
   random_state: 42
   # XGBoost hyperparameters. Tuning depends on class balance in YOUR dataset.
