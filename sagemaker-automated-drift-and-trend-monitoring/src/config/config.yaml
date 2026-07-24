@@ -176,8 +176,7 @@ lambda:
 # ---------------------------------------------------------------------------
 # Training data is downloaded at runtime by src/setup/download_dataset.py —
 # the local CSVs below are NOT in the repo and only materialize if you run
-# that script. (For the Kaggle credit-card dataset, use
-# src/setup/download_kaggle_dataset.py instead.)
+# that script.
 #
 # Drifted data is generated at runtime by src/drift_monitoring/generate_drift_dataset.py
 # (see drift_generation block further down) and written to
@@ -210,7 +209,6 @@ data:
 #   - target_column / features → src/config/dataset_schema.yaml (read via
 #     src.config.schema.target_column() / schema.feature_names())
 #   - Dataset download/transform → src/setup/download_dataset.py
-#   - Kaggle-column → project-column rename map → src/setup/download_kaggle_dataset.py
 # Only XGBoost hyperparameters live in this section because they're tunable
 # without re-deriving the dataset.
 training:

@@ -353,7 +353,7 @@ LAMBDA_EXEC_ROLE: str = _get("lambda", "exec_role", "LAMBDA_EXEC_ROLE", "")
 # ===================================================================
 DATA_DIR: Path = _PROJECT_ROOT / "data"
 
-# Local CSV paths (used only by upload_data_to_s3.py and download_dataset.py/download_kaggle_dataset.py)
+# Local CSV paths (used only by upload_data_to_s3.py and download_dataset.py)
 CSV_TRAINING_DATA: Path = _PROJECT_ROOT / _get(
     "data", "csv_training_data", "CSV_TRAINING_DATA",
     "data/bank_marketing_predictions_final.csv",

@@ -10,7 +10,7 @@
 # To bring your own dataset:
 #   1. Edit this file: identifier_column, target_column, and the full
 #      `features` list (name + type) for YOUR data.
-#   2. Point your own loader (replacing src/setup/download_kaggle_dataset.py)
+#   2. Point your own loader (replacing src/setup/download_dataset.py)
 #      at your source CSV/table so it emits rows in schema.csv_column_order().
 #   3. Recreate the Athena tables against the new schema:
 #         ./cloudformation/deploy-stack.sh --recreate-database
