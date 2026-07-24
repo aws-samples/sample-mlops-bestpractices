@@ -120,26 +120,26 @@ MLFLOW_TRACKING_URI: str = _get(
 )
 MLFLOW_EXPERIMENT_NAME: str = _get(
     "mlflow", "experiment_name", "MLFLOW_EXPERIMENT_NAME",
-    "ml-model-training",
+    "credit-card-fraud-detection-training",
 )
 MLFLOW_INFERENCE_EXPERIMENT_NAME: str = _get(
     "mlflow", "inference_experiment_name", "MLFLOW_INFERENCE_EXPERIMENT_NAME",
-    "ml-model-inference",
+    "credit-card-fraud-detection-inference",
 )
 MLFLOW_BATCH_EXPERIMENT_NAME: str = _get(
     "mlflow", "batch_experiment_name", "MLFLOW_BATCH_EXPERIMENT_NAME",
-    "ml-model-batch",
+    "credit-card-fraud-detection-batch",
 )
 MLFLOW_MONITORING_EXPERIMENT_NAME: str = _get(
     "mlflow", "monitoring_experiment_name", "MLFLOW_MONITORING_EXPERIMENT_NAME",
-    "ml-model-monitoring",
+    "credit-card-fraud-detection-monitoring",
 )
 # 🔁 SYNC: lambda_drift_monitor.py:52 — Lambda reads this as
 # `MODEL_PACKAGE_GROUP` (the SageMaker MPG name happens to equal the MLflow
 # registered-model name in this project; deploy_lambda_container.sh sets the
-# env var from this constant). Lambda fallback: 'ml-model'.
+# env var from this constant). Lambda fallback: 'fraud-detection'.
 MLFLOW_MODEL_NAME: str = _get(
-    "mlflow", "model_name", "MLFLOW_MODEL_NAME", "ml-model"
+    "mlflow", "model_name", "MLFLOW_MODEL_NAME", "fraud-detection"
 )
 
 # ===================================================================
@@ -147,18 +147,19 @@ MLFLOW_MODEL_NAME: str = _get(
 # ===================================================================
 # The endpoint's custom inference handler writes each prediction to the
 # inference_responses Athena table using these column names. Defaults match
-# the reference implementation. Downstream code (drift Lambda, dashboards,
-# batch transform) reads columns via these constants so BYO users can point
-# them at a differently-named handler output without editing every SQL query.
+# the fraud-detection reference implementation. Downstream code
+# (drift Lambda, dashboards, batch transform) reads columns via these
+# constants so BYO users can point them at a differently-named handler
+# output without editing every SQL query.
 PREDICTION_COLUMN: str = _get(
     "inference", "prediction_column", "PREDICTION_COLUMN", "prediction"
 )
 PROBABILITY_COLUMN: str = _get(
-    "inference", "probability_column", "PROBABILITY_COLUMN", "probability_positive"
+    "inference", "probability_column", "PROBABILITY_COLUMN", "probability_fraud"
 )
 PROBABILITY_ALT_COLUMN: str = _get(
     "inference", "probability_alt_column", "PROBABILITY_ALT_COLUMN",
-    "probability_negative",
+    "probability_non_fraud",
 )
 
 # ===================================================================
@@ -177,11 +178,11 @@ XGBOOST_NUM_CLASS: int = int(
 # ===================================================================
 # Athena
 # ===================================================================
-# 🔁 SYNC: lambda_drift_monitor.py:49 — Lambda fallback: 'ml_monitoring'.
-ATHENA_DATABASE: str = _get("athena", "database", "ATHENA_DATABASE", "ml_monitoring")
+# 🔁 SYNC: lambda_drift_monitor.py:49 — Lambda fallback: 'fraud_detection'.
+ATHENA_DATABASE: str = _get("athena", "database", "ATHENA_DATABASE", "fraud_detection")
 ATHENA_WORKGROUP: str = _get("athena", "workgroup", "ATHENA_WORKGROUP", "primary")
 # 🔁 SYNC: lambda_drift_monitor.py:50 — Lambda fallback:
-# 's3://ml-monitoring-data-lake/athena-query-results/'. That fallback path
+# 's3://fraud-detection-data-lake/athena-query-results/'. That fallback path
 # is wrong on accounts that don't have that bucket — at deploy time
 # deploy_lambda_container.sh derives the correct s3://<data-bucket>/...
 # from PROJECT_NAME + account ID and overrides via the env var.
@@ -308,7 +309,7 @@ S3_BATCH_TRANSFORM_OUTPUT: str = _s3_path(
 SQS_QUEUE_URL: str = _get("sqs", "inference_queue_url", "SQS_QUEUE_URL", "")
 MONITORING_SQS_QUEUE_NAME: str = _get(
     "sqs", "monitoring_queue_name", "MONITORING_SQS_QUEUE_NAME",
-    "fraud-detection-monitoring-results",
+    "fraud-monitoring-results",
 )
 # 🔁 SYNC: lambda_drift_monitor.py:55 — Lambda fallback: '' (empty string).
 # When empty, the Lambda computes drift results but skips SQS dispatch, so
@@ -452,7 +453,7 @@ DRIFT_MONITOR_SCHEDULE: str = _drift_mon_cfg.get(
 # them via `python -m src.config.config_shell` (no shell-side defaults).
 # ===================================================================
 # 🔁 SYNC: lambda_drift_monitor.py:132 + line 1034 — Lambda reads
-# ENDPOINT_NAME from env (fallback '' at module init, then 'ml-model-endpoint'
+# ENDPOINT_NAME from env (fallback '' at module init, then 'fraud-detector-endpoint'
 # at the final write site). deploy_lambda_container.sh resolves this constant
 # and sets the env var so both reads land on the same name.
 ENDPOINT_NAME: str = _get(
@@ -464,7 +465,7 @@ DRIFT_LAMBDA_NAME: str = _get(
 )
 MONITORING_WRITER_LAMBDA_NAME: str = _get(
     "monitoring_writer", "lambda_name", "MONITORING_WRITER_LAMBDA_NAME",
-    "fraud-detection-monitoring-results-writer",
+    "fraud-monitoring-results-writer",
 )
 EVENTBRIDGE_RULE_NAME: str = _get(
     "drift_monitor", "eventbridge_rule_name", "EVENTBRIDGE_RULE_NAME",
@@ -472,7 +473,7 @@ EVENTBRIDGE_RULE_NAME: str = _get(
 )
 SNS_TOPIC_NAME: str = _get(
     "drift_monitor", "sns_topic_name", "SNS_TOPIC_NAME",
-    "fraud-detection-monitoring-drift-alerts",
+    "fraud-detection-drift-alerts",
 )
 CLOUDWATCH_DASHBOARD_NAME: str = _get(
     "drift_monitor", "cloudwatch_dashboard_name", "CLOUDWATCH_DASHBOARD_NAME",
@@ -531,7 +532,7 @@ MONITORING_MODEL_DRIFT_LOOKBACK_DAYS: int = int(
 # ===================================================================
 # These knobs let notebook 2 inject controlled drift into the ground-truth
 # simulator so the monitoring pipeline can be exercised end-to-end. In
-# production, ground truth comes from operational investigation feeds; these
+# production, ground truth comes from fraud-investigation feeds; these
 # constants are unused.
 GROUND_TRUTH_SIM_ACCURACY: float = float(
     os.environ.get("GROUND_TRUTH_SIM_ACCURACY", "0.85")
@@ -580,7 +581,7 @@ QUICKSIGHT_FEATURE_LEVEL_DATASET_NAME: str = "Fraud Governance - Feature Level D
 QUICKSIGHT_ACCURACY_DATASET_ID: str = "fraud-governance-inference-dataset-accuracy"
 QUICKSIGHT_ACCURACY_DATASET_NAME: str = "Prediction Accuracy Timeline"
 QUICKSIGHT_ANALYSIS_ID: str = "fraud-governance-analysis"
-QUICKSIGHT_ANALYSIS_NAME: str = "Fraud Detection Governance"
+QUICKSIGHT_ANALYSIS_NAME: str = "Fraud Detection Governance Analysis"
 QUICKSIGHT_DASHBOARD_ID: str = "fraud-governance-dashboard"
 QUICKSIGHT_DASHBOARD_NAME: str = "Fraud Detection Governance"
 QUICKSIGHT_SERVICE_ROLE_NAME: str = "aws-quicksight-service-role-v0"
