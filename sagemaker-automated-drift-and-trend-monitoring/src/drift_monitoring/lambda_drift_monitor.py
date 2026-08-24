@@ -28,7 +28,11 @@ import numpy as np
 import pandas as pd
 
 # Evidently-based reporting (used by check_data_drift / check_model_drift)
-from src.drift_monitoring.evidently_reports import run_data_drift_report, run_classification_report
+from src.drift_monitoring.evidently_reports import (
+    run_data_drift_report,
+    run_classification_report,
+    run_regression_report,
+)
 from src.config import schema
 
 # MLflow
@@ -45,6 +49,7 @@ s3 = boto3.client('s3')
 sns = boto3.client('sns')
 sqs = boto3.client('sqs')
 sagemaker_client = boto3.client('sagemaker')
+cloudwatch = boto3.client('cloudwatch')
 
 # Configuration from environment variables
 ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
@@ -54,6 +59,12 @@ MODEL_PACKAGE_GROUP = os.getenv('MODEL_PACKAGE_GROUP', 'fraud-detection')
 SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')
 MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
 MONITORING_SQS_QUEUE_URL = os.getenv('MONITORING_SQS_QUEUE_URL', '')
+
+# CloudWatch namespace for drift metrics published on every scheduled run.
+# MUST match the namespace create_cloudwatch_monitoring.py builds its alarms
+# and dashboard against (CLOUDWATCH_NAMESPACE there defaults to the same
+# value) — otherwise the alarms/dashboard show "no data".
+CLOUDWATCH_NAMESPACE = os.getenv('CLOUDWATCH_NAMESPACE', 'FraudDetection/DriftMonitoring')
 
 # Thresholds
 DATA_DRIFT_THRESHOLD = float(os.getenv('DATA_DRIFT_THRESHOLD', '0.2'))  # PSI threshold
@@ -79,6 +90,13 @@ TRAINING_FEATURES = schema.feature_names()
 TARGET_COLUMN = os.getenv('TARGET_COLUMN', schema.target_column())
 PREDICTION_COLUMN = os.getenv('PREDICTION_COLUMN', 'prediction')
 PROBABILITY_COLUMN = os.getenv('PROBABILITY_COLUMN', 'probability_fraud')
+
+# ML problem type — drives which metrics / Evidently preset the model-quality
+# check uses. Resolved from the PROBLEM_TYPE env var or the dataset schema
+# (schema.problem_type()), defaulting to binary classification so an existing
+# binary deployment behaves exactly as before. One of:
+#   'binary_classification' | 'multiclass_classification' | 'regression'
+PROBLEM_TYPE = os.getenv('PROBLEM_TYPE') or schema.problem_type()
 
 
 def execute_athena_query(sql, wait=True):
@@ -532,7 +550,13 @@ def check_model_drift():
     Returns:
         dict with model drift results or None if insufficient data.
     """
-    print("🔍 Checking model drift (Evidently)...")
+    # Regression models take a completely different metric path (MAE/RMSE/R2
+    # instead of ROC-AUC/precision/recall) — dispatch early.
+    if PROBLEM_TYPE == 'regression':
+        return _check_regression_drift()
+
+    is_multiclass = PROBLEM_TYPE == 'multiclass_classification'
+    print(f"🔍 Checking model drift (Evidently, {PROBLEM_TYPE})...")
 
     # Get recent predictions with ground truth (using configured lookback period)
     lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
@@ -565,42 +589,80 @@ def check_model_drift():
     current_df = pd.DataFrame(recent_performance)
     current_df['ground_truth'] = current_df['ground_truth'].astype(int)
     current_df['prediction'] = current_df['prediction'].astype(int)
-    current_df['probability_fraud'] = current_df['probability_fraud'].astype(float)
+    # probability_fraud is only meaningful for a binary score. For multiclass
+    # a single probability column can't feed ROC-AUC, so parse it best-effort
+    # and don't rely on it below.
+    current_df['probability_fraud'] = pd.to_numeric(
+        current_df['probability_fraud'], errors='coerce'
+    )
 
-    # Compute sklearn metrics for the SNS alert / response payload
+    # Compute sklearn metrics for the SNS alert / response payload.
+    # Binary averages the positive class (default); multiclass uses macro
+    # averaging so every class counts equally regardless of support.
     from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score
 
     y_true = current_df['ground_truth'].values
     y_pred = current_df['prediction'].values
     y_prob = current_df['probability_fraud'].values
 
-    current_roc_auc = roc_auc_score(y_true, y_prob)
+    avg = 'macro' if is_multiclass else 'binary'
     current_accuracy = accuracy_score(y_true, y_pred)
-    current_precision = precision_score(y_true, y_pred, zero_division=0)
-    current_recall = recall_score(y_true, y_pred, zero_division=0)
+    current_precision = precision_score(y_true, y_pred, average=avg, zero_division=0)
+    current_recall = recall_score(y_true, y_pred, average=avg, zero_division=0)
 
-    print(f"  Current ROC-AUC: {current_roc_auc:.4f}")
-    print(f"  Current Accuracy: {current_accuracy:.4f}")
-    print(f"  Current Precision: {current_precision:.4f}")
-    print(f"  Current Recall: {current_recall:.4f}")
+    # ROC-AUC only applies to the binary single-probability case. For
+    # multiclass we set it to None and use accuracy as the primary metric.
+    if is_multiclass:
+        current_roc_auc = None
+        print(f"  Current Accuracy: {current_accuracy:.4f}")
+        print(f"  Current Precision (macro): {current_precision:.4f}")
+        print(f"  Current Recall (macro): {current_recall:.4f}")
+    else:
+        current_roc_auc = roc_auc_score(y_true, y_prob)
+        print(f"  Current ROC-AUC: {current_roc_auc:.4f}")
+        print(f"  Current Accuracy: {current_accuracy:.4f}")
+        print(f"  Current Precision: {current_precision:.4f}")
+        print(f"  Current Recall: {current_recall:.4f}")
 
     # Compare to baseline. Source of truth is baseline.json registered on
     # the latest Approved ModelPackage — that anchors the baseline to the
     # exact slice (evaluation_data) the model was scored on at training.
     # Falls back to BASELINE_ROC_AUC env var only when the registry lookup
     # fails (e.g., first ever monitor run before any model is approved).
+    # Primary degradation metric depends on the problem type:
+    #   binary     → ROC-AUC (baseline.json 'roc_auc', else BASELINE_ROC_AUC)
+    #   multiclass → accuracy (baseline.json 'accuracy', else BASELINE_ACCURACY),
+    #                since a single probability column can't produce ROC-AUC.
     baseline = load_baseline_from_registry()
-    if baseline and 'metrics' in baseline and 'roc_auc' in baseline['metrics']:
-        baseline_roc_auc = float(baseline['metrics']['roc_auc'])
-        baseline_source = baseline.get('model_package_arn', 'registered baseline.json')
+    baseline_metrics = (baseline or {}).get('metrics', {}) if baseline else {}
+
+    if is_multiclass:
+        primary_metric = 'accuracy'
+        current_primary = current_accuracy
+        if 'accuracy' in baseline_metrics:
+            baseline_primary = float(baseline_metrics['accuracy'])
+            baseline_source = baseline.get('model_package_arn', 'registered baseline.json')
+        else:
+            baseline_primary = float(os.getenv('BASELINE_ACCURACY', '0.90'))
+            baseline_source = 'env:BASELINE_ACCURACY (no registered baseline.json found)'
+        # ROC-AUC is not defined for the multiclass single-probability case.
+        baseline_roc_auc = None
     else:
-        baseline_roc_auc = float(os.getenv('BASELINE_ROC_AUC', '0.92'))
-        baseline_source = 'env:BASELINE_ROC_AUC (no registered baseline.json found)'
+        primary_metric = 'roc_auc'
+        current_primary = current_roc_auc
+        if 'roc_auc' in baseline_metrics:
+            baseline_primary = float(baseline_metrics['roc_auc'])
+            baseline_source = baseline.get('model_package_arn', 'registered baseline.json')
+        else:
+            baseline_primary = float(os.getenv('BASELINE_ROC_AUC', '0.92'))
+            baseline_source = 'env:BASELINE_ROC_AUC (no registered baseline.json found)'
+        baseline_roc_auc = baseline_primary
 
-    degradation = baseline_roc_auc - current_roc_auc
-    degradation_pct = (degradation / baseline_roc_auc) * 100
+    degradation = baseline_primary - current_primary
+    degradation_pct = (degradation / baseline_primary) * 100 if baseline_primary else 0.0
 
-    print(f"  Baseline ROC-AUC: {baseline_roc_auc:.4f}  ← {baseline_source}")
+    print(f"  Baseline {primary_metric}: {baseline_primary:.4f}  ← {baseline_source}")
+    print(f"  Current {primary_metric}:  {current_primary:.4f}")
     print(f"  Degradation: {degradation:.4f} ({degradation_pct:.1f}%)")
 
     # Build a synthetic baseline DataFrame with the same schema so Evidently
@@ -664,6 +726,7 @@ def check_model_drift():
                 target_column='ground_truth',
                 prediction_column='prediction',
                 output_path=html_path,
+                multiclass=is_multiclass,
             )
         except ValueError as e:
             # Pre-flight in run_classification_report caught a degenerate case
@@ -678,6 +741,10 @@ def check_model_drift():
 
     return {
         'detected': detected,
+        'problem_type': PROBLEM_TYPE,
+        'primary_metric': primary_metric,
+        'baseline_primary': baseline_primary,
+        'current_primary': current_primary,
         'baseline_roc_auc': baseline_roc_auc,
         'current_roc_auc': current_roc_auc,
         'degradation': degradation,
@@ -688,6 +755,167 @@ def check_model_drift():
         'sample_size': len(recent_performance),
         'html_report_path': html_path if classification_result else None,
         'evidently_metrics': classification_result.get('metrics', []) if classification_result else [],
+    }
+
+
+def _check_regression_drift():
+    """Model-quality drift for a regression target (MAE / RMSE / R²).
+
+    The regression analogue of the classification path in
+    ``check_model_drift``: pulls recent predictions + numeric ground truth,
+    computes error metrics, compares RMSE against a prior-window baseline,
+    and generates an Evidently RegressionPreset report. RMSE is the primary
+    metric — degradation is a RELATIVE INCREASE in RMSE (higher = worse), so
+    ``degradation_pct >= MODEL_DRIFT_THRESHOLD * 100`` flags drift, matching
+    the "percent worse than baseline" semantics the classification path uses.
+
+    Returns a result dict shaped for the same downstream consumers
+    (send_sns_alert / write_monitoring_results / publish_cloudwatch_metrics /
+    log_to_mlflow) with classification-only fields set to None.
+    """
+    print(f"🔍 Checking model drift (Evidently, {PROBLEM_TYPE})...")
+
+    lookback_start = (datetime.now() - timedelta(days=MODEL_DRIFT_LOOKBACK_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"  Querying predictions with ground truth from last {MODEL_DRIFT_LOOKBACK_DAYS} days (since {lookback_start})")
+
+    performance_sql = f"""
+    SELECT
+        {PREDICTION_COLUMN} AS prediction,
+        ground_truth
+    FROM {ATHENA_DATABASE}.inference_responses
+    WHERE ground_truth IS NOT NULL
+      AND request_timestamp >= TIMESTAMP '{lookback_start}'
+    LIMIT 10000
+    """
+    recent_performance = execute_athena_query(performance_sql)
+
+    if len(recent_performance) < MIN_SAMPLES:
+        print(f"⚠️ Not enough samples with ground truth ({len(recent_performance)} < {MIN_SAMPLES})")
+        return None
+
+    print(f"✓ Found {len(recent_performance)} samples with ground truth")
+
+    current_df = pd.DataFrame(recent_performance)
+    current_df['prediction'] = pd.to_numeric(current_df['prediction'], errors='coerce')
+    current_df['ground_truth'] = pd.to_numeric(current_df['ground_truth'], errors='coerce')
+    current_df = current_df.dropna(subset=['prediction', 'ground_truth'])
+
+    if len(current_df) < MIN_SAMPLES:
+        print(f"⚠️ Not enough numeric samples after parsing ({len(current_df)} < {MIN_SAMPLES})")
+        return None
+
+    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+    y_true = current_df['ground_truth'].values
+    y_pred = current_df['prediction'].values
+
+    current_mae = float(mean_absolute_error(y_true, y_pred))
+    current_rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    current_r2 = float(r2_score(y_true, y_pred))
+
+    print(f"  Current MAE:  {current_mae:.4f}")
+    print(f"  Current RMSE: {current_rmse:.4f}")
+    print(f"  Current R²:   {current_r2:.4f}")
+
+    # Baseline RMSE: baseline.json 'rmse' if present, else BASELINE_RMSE env,
+    # else the prior-window RMSE computed the same way.
+    baseline = load_baseline_from_registry()
+    baseline_metrics = (baseline or {}).get('metrics', {}) if baseline else {}
+
+    baseline_rmse = None
+    baseline_source = None
+    if 'rmse' in baseline_metrics:
+        baseline_rmse = float(baseline_metrics['rmse'])
+        baseline_source = baseline.get('model_package_arn', 'registered baseline.json')
+
+    # Prior-window baseline DataFrame (for the Evidently report + RMSE fallback).
+    baseline_sql = f"""
+    SELECT
+        {PREDICTION_COLUMN} AS prediction,
+        ground_truth
+    FROM {ATHENA_DATABASE}.inference_responses
+    WHERE ground_truth IS NOT NULL
+      AND request_timestamp < TIMESTAMP '{lookback_start}'
+    ORDER BY RANDOM()
+    LIMIT 10000
+    """
+    try:
+        baseline_data = execute_athena_query(baseline_sql)
+        baseline_df = pd.DataFrame(baseline_data)
+        if len(baseline_df) >= MIN_SAMPLES:
+            baseline_df['prediction'] = pd.to_numeric(baseline_df['prediction'], errors='coerce')
+            baseline_df['ground_truth'] = pd.to_numeric(baseline_df['ground_truth'], errors='coerce')
+            baseline_df = baseline_df.dropna(subset=['prediction', 'ground_truth'])
+        if len(baseline_df) < MIN_SAMPLES:
+            baseline_df = current_df.copy()
+    except Exception:
+        baseline_df = current_df.copy()
+
+    if baseline_rmse is None:
+        # Fall back to the prior-window RMSE (or env, or current as last resort).
+        env_rmse = os.getenv('BASELINE_RMSE')
+        if env_rmse is not None:
+            baseline_rmse = float(env_rmse)
+            baseline_source = 'env:BASELINE_RMSE'
+        elif len(baseline_df) >= MIN_SAMPLES:
+            baseline_rmse = float(np.sqrt(mean_squared_error(
+                baseline_df['ground_truth'].values, baseline_df['prediction'].values
+            )))
+            baseline_source = 'prior-window RMSE'
+        else:
+            baseline_rmse = current_rmse
+            baseline_source = 'current-window RMSE (no baseline available)'
+
+    # Degradation = relative INCREASE in RMSE (higher RMSE = worse).
+    degradation = current_rmse - baseline_rmse
+    degradation_pct = (degradation / baseline_rmse) * 100 if baseline_rmse else 0.0
+
+    print(f"  Baseline RMSE: {baseline_rmse:.4f}  ← {baseline_source}")
+    print(f"  RMSE increase: {degradation:.4f} ({degradation_pct:.1f}%)")
+
+    # Evidently RegressionPreset report.
+    html_path = tempfile.NamedTemporaryFile(
+        suffix='.html', prefix='model_reg_', delete=False, dir='/tmp'
+    ).name
+    regression_result = None
+    try:
+        regression_result = run_regression_report(
+            baseline_df=baseline_df,
+            current_df=current_df,
+            target_column='ground_truth',
+            prediction_column='prediction',
+            output_path=html_path,
+        )
+    except ValueError as e:
+        print(f"  ⚠ Skipping Evidently regression report: {e}")
+
+    detected = degradation_pct >= (MODEL_DRIFT_THRESHOLD * 100)
+    if detected:
+        print("  🚨 Model performance drift DETECTED (RMSE increase)")
+    else:
+        print("  ✓ No model performance drift detected")
+
+    return {
+        'detected': detected,
+        'problem_type': PROBLEM_TYPE,
+        'primary_metric': 'rmse',
+        'baseline_primary': baseline_rmse,
+        'current_primary': current_rmse,
+        # Classification-only fields left None so downstream consumers that
+        # read them (write_monitoring_results, publish, alert) degrade cleanly.
+        'baseline_roc_auc': None,
+        'current_roc_auc': None,
+        'accuracy': None,
+        'precision': None,
+        'recall': None,
+        'degradation': degradation,
+        'degradation_pct': degradation_pct,
+        'mae': current_mae,
+        'rmse': current_rmse,
+        'r2': current_r2,
+        'sample_size': len(current_df),
+        'html_report_path': html_path if regression_result else None,
+        'evidently_metrics': regression_result.get('metrics', []) if regression_result else [],
     }
 
 
@@ -737,19 +965,52 @@ def send_sns_alert(data_drift_result, model_drift_result):
         message_lines.append("")
 
     if model_drift_detected:
+        # The alert body adapts to the problem type: binary reports ROC-AUC +
+        # accuracy/precision/recall, multiclass reports accuracy (its primary)
+        # + macro precision/recall, and regression reports RMSE/MAE/R². Every
+        # value is formatted through _fmt so a None (e.g. ROC-AUC on a
+        # regression run) renders as "n/a" instead of crashing on ``:.4f``.
+        def _fmt(val, spec='.4f'):
+            if val is None:
+                return "n/a"
+            try:
+                return format(float(val), spec)
+            except (TypeError, ValueError):
+                return str(val)
+
+        problem_type = model_drift_result.get('problem_type', 'binary_classification')
+        primary_metric = model_drift_result.get('primary_metric', 'roc_auc')
+        preset = 'RegressionPreset' if problem_type == 'regression' else 'ClassificationPreset'
+
         message_lines.extend([
-            "🔴 MODEL PERFORMANCE DRIFT DETECTED (Evidently ClassificationPreset)",
+            f"🔴 MODEL PERFORMANCE DRIFT DETECTED (Evidently {preset})",
             "=" * 80,
-            f"Baseline ROC-AUC: {model_drift_result['baseline_roc_auc']:.4f}",
-            f"Current ROC-AUC: {model_drift_result['current_roc_auc']:.4f}",
-            f"Degradation: {model_drift_result['degradation']:.4f} ({model_drift_result['degradation_pct']:.1f}%)",
+            f"Problem Type: {problem_type}",
+            f"Primary Metric: {primary_metric.upper()}",
+            f"Baseline {primary_metric.upper()}: {_fmt(model_drift_result.get('baseline_primary'))}",
+            f"Current {primary_metric.upper()}:  {_fmt(model_drift_result.get('current_primary'))}",
+            f"Degradation: {_fmt(model_drift_result.get('degradation'))} "
+            f"({_fmt(model_drift_result.get('degradation_pct'), '.1f')}%)",
             f"Threshold: {MODEL_DRIFT_THRESHOLD * 100:.1f}%",
             "",
-            f"Current Accuracy: {model_drift_result['accuracy']:.4f}",
-            f"Current Precision: {model_drift_result['precision']:.4f}",
-            f"Current Recall: {model_drift_result['recall']:.4f}",
-            "",
         ])
+
+        if problem_type == 'regression':
+            message_lines.extend([
+                f"Current MAE:  {_fmt(model_drift_result.get('mae'))}",
+                f"Current RMSE: {_fmt(model_drift_result.get('rmse'))}",
+                f"Current R²:   {_fmt(model_drift_result.get('r2'))}",
+                "",
+            ])
+        else:
+            # Binary shows ROC-AUC; multiclass has it as None → renders "n/a".
+            message_lines.extend([
+                f"Current ROC-AUC: {_fmt(model_drift_result.get('current_roc_auc'))}",
+                f"Current Accuracy: {_fmt(model_drift_result.get('accuracy'))}",
+                f"Current Precision: {_fmt(model_drift_result.get('precision'))}",
+                f"Current Recall: {_fmt(model_drift_result.get('recall'))}",
+                "",
+            ])
 
     message_lines.extend([
         "=" * 80,
@@ -962,15 +1223,40 @@ def log_to_mlflow(data_drift_result, model_drift_result):
 
             # --- Model drift metrics + Evidently report ---
             if model_drift_result:
+                # mlflow.log_metric rejects None, so only log metrics the run
+                # actually produced. A regression run has None for ROC-AUC /
+                # accuracy / precision / recall and instead carries mae/rmse/r2;
+                # a multiclass run has None for ROC-AUC. _log_metric skips any
+                # None so the same call list works for every problem type.
+                def _log_metric(name, value):
+                    if value is None:
+                        return
+                    try:
+                        mlflow.log_metric(name, float(value))
+                    except (TypeError, ValueError):
+                        pass
+
                 mlflow.log_metric("model_drift_detected", 1 if model_drift_result['detected'] else 0)
-                mlflow.log_metric("baseline_roc_auc", model_drift_result['baseline_roc_auc'])
-                mlflow.log_metric("current_roc_auc", model_drift_result['current_roc_auc'])
-                mlflow.log_metric("roc_auc_degradation", model_drift_result['degradation'])
-                mlflow.log_metric("roc_auc_degradation_pct", model_drift_result['degradation_pct'])
-                mlflow.log_metric("current_accuracy", model_drift_result['accuracy'])
-                mlflow.log_metric("current_precision", model_drift_result['precision'])
-                mlflow.log_metric("current_recall", model_drift_result['recall'])
-                mlflow.log_metric("model_sample_size", model_drift_result['sample_size'])
+                # Problem-type-agnostic primary metric (roc_auc | accuracy | rmse).
+                mlflow.log_param("model_primary_metric", model_drift_result.get('primary_metric', 'roc_auc'))
+                mlflow.log_param("model_problem_type", model_drift_result.get('problem_type', 'binary_classification'))
+                _log_metric("baseline_primary", model_drift_result.get('baseline_primary'))
+                _log_metric("current_primary", model_drift_result.get('current_primary'))
+                _log_metric("baseline_roc_auc", model_drift_result.get('baseline_roc_auc'))
+                _log_metric("current_roc_auc", model_drift_result.get('current_roc_auc'))
+                # Degradation columns keep their historical roc_auc_* names for
+                # dashboard continuity even though they now track whichever
+                # primary metric the problem type uses.
+                _log_metric("roc_auc_degradation", model_drift_result.get('degradation'))
+                _log_metric("roc_auc_degradation_pct", model_drift_result.get('degradation_pct'))
+                _log_metric("current_accuracy", model_drift_result.get('accuracy'))
+                _log_metric("current_precision", model_drift_result.get('precision'))
+                _log_metric("current_recall", model_drift_result.get('recall'))
+                # Regression-only quality metrics.
+                _log_metric("current_mae", model_drift_result.get('mae'))
+                _log_metric("current_rmse", model_drift_result.get('rmse'))
+                _log_metric("current_r2", model_drift_result.get('r2'))
+                _log_metric("model_sample_size", model_drift_result.get('sample_size'))
 
                 # Log Evidently classification metrics (accuracy, F1, etc.)
                 for m in model_drift_result.get('evidently_metrics', []):
@@ -1063,12 +1349,14 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
                 'threshold': info.get('threshold', 0),
             }
 
-    # Compute F1 from precision and recall if model drift available
+    # Compute F1 from precision and recall if model drift available.
+    # Regression runs carry precision/recall as None (F1 is undefined there),
+    # so guard on both being present before dividing.
     f1 = None
     if model_drift_result:
-        p = model_drift_result.get('precision', 0)
-        r = model_drift_result.get('recall', 0)
-        if p + r > 0:
+        p = model_drift_result.get('precision')
+        r = model_drift_result.get('recall')
+        if p is not None and r is not None and (p + r) > 0:
             f1 = 2 * p * r / (p + r)
 
     data_detected = data_drift_result.get('detected', False) if data_drift_result else False
@@ -1110,6 +1398,15 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
         'precision': model_drift_result.get('precision') if model_drift_result else None,
         'recall': model_drift_result.get('recall') if model_drift_result else None,
         'f1_score': f1,
+        # TODO(regression): a regression run computes mae/rmse/r2 (see
+        # _check_regression_drift) but the monitoring_responses Iceberg table
+        # has no columns for them, so they're published to CloudWatch + MLflow
+        # only, not persisted to Athena. Persisting them means an ADD COLUMNS
+        # on an existing table — deliberately deferred (schema changes on a
+        # live table are risky). When ready: add mae/rmse/r2 DOUBLE columns in
+        # create_monitoring_table.py, add them to the writer, then include them
+        # in this record. The degradation (RMSE increase) already lands in the
+        # generic roc_auc_degradation column above.
         'model_sample_size': model_drift_result.get('sample_size') if model_drift_result else None,
         'per_feature_drift_scores': json.dumps(per_feature) if per_feature else None,
         'evidently_report_s3_path': None,  # Populated if reports uploaded to S3
@@ -1155,6 +1452,93 @@ def write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_i
 
 
 # =========================================================================
+# CloudWatch metrics — published on every scheduled run
+#
+# The scheduled Lambda already fans results out to MLflow (artifacts),
+# Athena (monitoring_responses), and SNS (alerts). This adds the fourth
+# sink SageMaker Model Monitor gave you for free: automatic per-run
+# CloudWatch metrics, so the alarms + dashboard built by
+# create_cloudwatch_monitoring.py light up from the schedule rather than
+# only when that script is run by hand.
+#
+# Metric names are chosen to match the widgets/alarms in
+# create_cloudwatch_monitoring.py. All metrics carry an `Endpoint`
+# dimension so multiple endpoints publishing to the same namespace stay
+# separable.
+# =========================================================================
+
+def publish_cloudwatch_metrics(data_drift_result, model_drift_result):
+    """Publish drift metrics to CloudWatch for the current run.
+
+    Uses the in-memory result dicts (not a re-read from Athena) so the
+    numbers are exactly what this run computed. Safe to call with either
+    result being None — only the metrics that exist are published.
+
+    Returns the number of metric datums published (0 if nothing to publish
+    or the put_metric_data call failed — failures are logged, never raised,
+    so a CloudWatch hiccup can't fail an otherwise-successful drift run).
+    """
+    endpoint = ENDPOINT_NAME or os.getenv('ENDPOINT_NAME', 'fraud-detector-endpoint')
+    dimensions = [{'Name': 'Endpoint', 'Value': endpoint}]
+    metric_data = []
+
+    def _add(name, value, unit='None'):
+        # Guard against None / non-finite values — CloudWatch rejects NaN/inf.
+        if value is None:
+            return
+        try:
+            fval = float(value)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(fval):
+            return
+        metric_data.append({
+            'MetricName': name,
+            'Value': fval,
+            'Unit': unit,
+            'Dimensions': dimensions,
+        })
+
+    if data_drift_result:
+        _add('DriftedColumnsShare', data_drift_result.get('drifted_columns_share'))
+        _add('DriftedColumnsCount', data_drift_result.get('drifted_features_count'), unit='Count')
+        _add('DataDriftDetected', 1 if data_drift_result.get('detected') else 0)
+
+    if model_drift_result:
+        _add('BaselineROCAUC', model_drift_result.get('baseline_roc_auc'))
+        _add('CurrentROCAUC', model_drift_result.get('current_roc_auc'))
+        _add('ROCAUCDegradation', model_drift_result.get('degradation'))
+        _add('Accuracy', model_drift_result.get('accuracy'))
+        _add('Precision', model_drift_result.get('precision'))
+        _add('Recall', model_drift_result.get('recall'))
+        # Regression runs surface MAE/RMSE/R2 instead of the classification
+        # metrics above; publish whichever the result carries.
+        _add('MAE', model_drift_result.get('mae'))
+        _add('RMSE', model_drift_result.get('rmse'))
+        _add('R2', model_drift_result.get('r2'))
+        _add('ModelDriftDetected', 1 if model_drift_result.get('detected') else 0)
+
+    if not metric_data:
+        print("⚠️ No CloudWatch metrics to publish (no drift results this run)")
+        return 0
+
+    try:
+        # CloudWatch caps put_metric_data at 1000 datums / 20 per request in
+        # practice; we send well under that, but batch by 20 to stay safe.
+        for i in range(0, len(metric_data), 20):
+            cloudwatch.put_metric_data(
+                Namespace=CLOUDWATCH_NAMESPACE,
+                MetricData=metric_data[i:i + 20],
+            )
+        print(f"✓ Published {len(metric_data)} metrics to CloudWatch "
+              f"namespace {CLOUDWATCH_NAMESPACE} (Endpoint={endpoint})")
+        return len(metric_data)
+    except Exception as e:
+        print(f"⚠️ Failed to publish CloudWatch metrics: {e}")
+        return 0
+
+
+# =========================================================================
 # Lambda entry point
 # =========================================================================
 
@@ -1179,6 +1563,11 @@ def lambda_handler(event, context):
 
         # Write monitoring results to SQS → Athena (with MLflow run ID)
         write_monitoring_results(data_drift_result, model_drift_result, mlflow_run_id)
+
+        # Publish this run's metrics to CloudWatch so the alarms + dashboard
+        # created by create_cloudwatch_monitoring.py update automatically on
+        # every scheduled run (not just when that script is run by hand).
+        publish_cloudwatch_metrics(data_drift_result, model_drift_result)
 
         # Prepare response (exclude local file paths)
         def _clean(result):

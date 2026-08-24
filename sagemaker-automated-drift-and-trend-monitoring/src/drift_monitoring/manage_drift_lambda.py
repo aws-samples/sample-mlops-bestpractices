@@ -142,7 +142,7 @@ def bootstrap_drift_lambda_role(
             else:
                 logger.warning(f"Failed to attach {policy_arn}: {e}")
 
-    # Inline policy for SQS + S3 access.
+    # Inline policy for SQS + S3 + CloudWatch access.
     inline_policy = {
         'Version': '2012-10-17',
         'Statement': [
@@ -159,6 +159,17 @@ def bootstrap_drift_lambda_role(
                     's3:ListBucket',
                     's3:GetBucketLocation',
                 ],
+                'Resource': '*',
+            },
+            {
+                # The drift Lambda publishes per-run metrics via
+                # cloudwatch:PutMetricData (see
+                # lambda_drift_monitor.publish_cloudwatch_metrics). PutMetricData
+                # does not support resource-level scoping, so Resource must be
+                # '*'; scope is instead enforced by the CloudWatch namespace
+                # the function writes to.
+                'Effect': 'Allow',
+                'Action': ['cloudwatch:PutMetricData'],
                 'Resource': '*',
             },
         ],

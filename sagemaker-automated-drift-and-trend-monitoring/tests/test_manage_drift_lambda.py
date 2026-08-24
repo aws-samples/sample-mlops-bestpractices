@@ -97,6 +97,42 @@ def test_bootstrap_drift_lambda_role_creates_when_missing():
     mock_sleep.assert_any_call(5)
 
 
+def test_bootstrap_drift_lambda_role_inline_policy_grants_put_metric_data():
+    """The inline policy attached by bootstrap must allow
+    cloudwatch:PutMetricData — without it the scheduled Lambda's
+    publish_cloudwatch_metrics() call is denied and the CloudWatch alarms
+    and dashboard stay on "no data". This is the IAM half of the
+    CloudWatch auto-publish fix.
+    """
+    iam_client = _make_iam_client(role_exists=True)
+    sts_client = _sts_client()
+
+    mdl.bootstrap_drift_lambda_role(
+        lambda_exec_role="arn:aws:iam::123456789012:role/my-drift-role",
+        iam_client=iam_client,
+        sts_client=sts_client,
+        propagation_wait_seconds=0,
+    )
+
+    iam_client.put_role_policy.assert_called_once()
+    _, kwargs = iam_client.put_role_policy.call_args
+    import json as _json
+
+    policy = _json.loads(kwargs["PolicyDocument"])
+    granted_actions = set()
+    for statement in policy["Statement"]:
+        actions = statement["Action"]
+        if isinstance(actions, str):
+            actions = [actions]
+        granted_actions.update(actions)
+
+    assert "cloudwatch:PutMetricData" in granted_actions, (
+        "bootstrap inline policy must grant cloudwatch:PutMetricData — "
+        "otherwise publish_cloudwatch_metrics() is denied at runtime and "
+        "the alarms/dashboard never receive data."
+    )
+
+
 def test_bootstrap_drift_lambda_role_defaults_role_name_when_no_exec_role():
     iam_client = _make_iam_client(role_exists=True)
     sts_client = _sts_client()

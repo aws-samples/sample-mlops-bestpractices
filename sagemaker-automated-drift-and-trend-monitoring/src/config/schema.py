@@ -114,6 +114,65 @@ def target_type() -> str:
     return _load().get("target_type", "boolean")
 
 
+def problem_type() -> str:
+    """ML problem type this model solves — drives which metrics and Evidently
+    preset the model-quality monitor uses.
+
+    Returns one of: ``"binary_classification"``, ``"multiclass_classification"``,
+    ``"regression"``.
+
+    Resolution order:
+      1. ``PROBLEM_TYPE`` environment variable (lets the Lambda deploy step
+         override without touching the schema file). Accepted values are the
+         three above, plus the shorthands ``"binary"``, ``"multiclass"``,
+         ``"regression"``.
+      2. An explicit ``problem_type`` key in dataset_schema.yaml.
+      3. Inferred from ``target_type()``:
+           - boolean / bool                         -> binary_classification
+           - float / double / numeric / real /
+             regression / continuous               -> regression
+           - categorical / string / multiclass      -> multiclass_classification
+           - anything else (incl. int/integer)      -> binary_classification
+             (the fraud reference target is an integer 0/1 label, so integer
+             defaults to binary rather than regression).
+
+    This is deliberately conservative: an unrecognized configuration falls
+    back to binary classification, which is the historical behavior of the
+    drift monitor — so adding this accessor never silently changes an
+    existing binary deployment.
+    """
+    import os
+
+    _CANON = {
+        "binary": "binary_classification",
+        "binary_classification": "binary_classification",
+        "multiclass": "multiclass_classification",
+        "multiclass_classification": "multiclass_classification",
+        "regression": "regression",
+    }
+
+    env_val = os.environ.get("PROBLEM_TYPE")
+    if env_val:
+        canon = _CANON.get(env_val.strip().lower())
+        if canon:
+            return canon
+
+    explicit = _load().get("problem_type")
+    if explicit:
+        canon = _CANON.get(str(explicit).strip().lower())
+        if canon:
+            return canon
+
+    t = target_type().strip().lower()
+    if t in ("boolean", "bool"):
+        return "binary_classification"
+    if t in ("float", "double", "numeric", "real", "regression", "continuous"):
+        return "regression"
+    if t in ("categorical", "string", "multiclass", "multiclass_classification"):
+        return "multiclass_classification"
+    return "binary_classification"
+
+
 def features() -> List[Feature]:
     """All model feature columns, in canonical order."""
     return [Feature(f["name"], f["type"]) for f in _load()["features"]]

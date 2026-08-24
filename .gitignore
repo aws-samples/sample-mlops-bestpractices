@@ -66,3 +66,6 @@ sagemaker-automated-drift-and-trend-monitoring/docs/guides/claude/
 
 # Bandit security scan output
 sagemaker-automated-drift-and-trend-monitoring/bandit.log
+
+# AWS docs reference notes (local working notes, not part of the solution)
+sagemaker-automated-drift-and-trend-monitoring/aws-docs-model-monitor-availability-change.md

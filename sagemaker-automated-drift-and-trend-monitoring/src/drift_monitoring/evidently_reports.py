@@ -41,9 +41,15 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 from evidently import Report
-from evidently.core.datasets import BinaryClassification, DataDefinition, Dataset
+from evidently.core.datasets import (
+    BinaryClassification,
+    DataDefinition,
+    Dataset,
+    MulticlassClassification,
+    Regression,
+)
 from evidently.metrics import DriftedColumnsCount, ValueDrift
-from evidently.presets import ClassificationPreset, DataDriftPreset
+from evidently.presets import ClassificationPreset, DataDriftPreset, RegressionPreset
 
 logger = logging.getLogger(__name__)
 
@@ -181,11 +187,18 @@ def run_classification_report(
     target_column: str = "target",
     prediction_column: str = "prediction",
     output_path: Optional[str] = None,
+    multiclass: bool = False,
 ) -> Dict[str, Any]:
     """
     Run Evidently ClassificationPreset report comparing baseline vs current model performance.
 
     Both DataFrames must contain the target and prediction columns.
+
+    Set ``multiclass=True`` for targets with more than two classes: the
+    Evidently data definition switches from ``BinaryClassification`` to
+    ``MulticlassClassification`` and the "both 0 AND 1 must appear" pre-flight
+    relaxes to "at least 2 distinct classes must appear". Leave it False (the
+    default) for the binary case, which is unchanged.
 
     ⚠ Evidently quirk — both class labels (0 AND 1) must appear in BOTH
     ``baseline_df`` and ``current_df``. If either side has only one class
@@ -250,21 +263,25 @@ def run_classification_report(
             if len(unique) < 2:
                 raise ValueError(
                     f"{label}.{col} has only {len(unique)} unique value(s): {unique}. "
-                    f"Evidently ClassificationPreset needs BOTH 0 and 1 in BOTH "
+                    f"Evidently ClassificationPreset needs at least 2 classes in BOTH "
                     f"target and prediction columns of BOTH datasets. "
-                    f"If the model never predicted the minority class on this sample, "
+                    f"If the model never predicted a class on this sample, "
                     f"either increase the sample size, lower the decision threshold, "
                     f"or stratify the upstream query to guarantee class diversity."
                 )
 
-    data_def = DataDefinition(
-        classification=[
-            BinaryClassification(
-                target=target_column,
-                prediction_labels=prediction_column,
-            )
-        ]
+    classification = (
+        MulticlassClassification(
+            target=target_column,
+            prediction_labels=prediction_column,
+        )
+        if multiclass
+        else BinaryClassification(
+            target=target_column,
+            prediction_labels=prediction_column,
+        )
     )
+    data_def = DataDefinition(classification=[classification])
 
     ref_dataset = Dataset.from_pandas(baseline_df, data_definition=data_def)
     cur_dataset = Dataset.from_pandas(current_df, data_definition=data_def)
@@ -283,5 +300,85 @@ def run_classification_report(
     }
 
     logger.info("Classification report generated successfully")
+    return result
+
+
+def run_regression_report(
+    baseline_df: pd.DataFrame,
+    current_df: pd.DataFrame,
+    target_column: str = "target",
+    prediction_column: str = "prediction",
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run Evidently RegressionPreset comparing baseline vs current model performance.
+
+    The regression analogue of ``run_classification_report``: use it when the
+    model predicts a continuous value rather than a class label. Both
+    DataFrames must contain the target (actual) and prediction columns as
+    numeric values.
+
+    Unlike the classification path there is no "both classes present"
+    pre-flight — the only requirement is that the target/prediction columns
+    are numeric and non-empty. Rows with a NaN in either column are dropped
+    (Evidently's regression metrics can't score a row with a missing actual
+    or prediction).
+
+    Args:
+        baseline_df: Reference data with numeric target and prediction columns.
+        current_df: Current data with numeric target and prediction columns.
+        target_column: Name of the ground-truth (actual value) column.
+        prediction_column: Name of the predicted value column.
+        output_path: If provided, saves the HTML report to this path.
+
+    Returns:
+        Dictionary with:
+            - 'snapshot': The Evidently report snapshot
+            - 'metrics': Raw metrics dict extracted from the report
+
+    Raises:
+        ValueError: If either dataframe has no rows left after dropping NaNs
+            in the target/prediction columns.
+    """
+    label_cols = [target_column, prediction_column]
+    baseline_df = baseline_df.dropna(subset=label_cols).copy()
+    current_df = current_df.dropna(subset=label_cols).copy()
+    for df in (baseline_df, current_df):
+        for col in label_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    baseline_df = baseline_df.dropna(subset=label_cols)
+    current_df = current_df.dropna(subset=label_cols)
+
+    for label, df in (("baseline_df", baseline_df), ("current_df", current_df)):
+        if len(df) == 0:
+            raise ValueError(
+                f"{label} has no numeric rows for regression scoring after "
+                f"dropping NaNs in {label_cols}. Check that {target_column!r} "
+                f"and {prediction_column!r} are populated numeric columns."
+            )
+
+    data_def = DataDefinition(
+        regression=[
+            Regression(target=target_column, prediction=prediction_column)
+        ]
+    )
+
+    ref_dataset = Dataset.from_pandas(baseline_df, data_definition=data_def)
+    cur_dataset = Dataset.from_pandas(current_df, data_definition=data_def)
+
+    report = Report(metrics=[RegressionPreset()])
+    snapshot = report.run(reference_data=ref_dataset, current_data=cur_dataset)
+
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        snapshot.save_html(output_path)
+        logger.info(f"Regression report saved to {output_path}")
+
+    result: Dict[str, Any] = {
+        "snapshot": snapshot,
+        "metrics": snapshot.dict().get("metrics", []),
+    }
+
+    logger.info("Regression report generated successfully")
     return result
 

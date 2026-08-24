@@ -70,7 +70,7 @@ def create_cloudwatch_monitoring(
         query = f"""
         SELECT
             timestamp,
-            data_drift_score,
+            drifted_columns_share,
             baseline_roc_auc,
             current_roc_auc,
             degradation,
@@ -121,11 +121,14 @@ def create_cloudwatch_monitoring(
                 # Publish metrics to CloudWatch
                 metrics_to_publish = []
 
-                # Data drift metrics
-                if latest.get('data_drift_score'):
+                # Data drift metric — share of columns that drifted this run
+                # (0..1). Must match the metric name the drift Lambda publishes
+                # in publish_cloudwatch_metrics() so the alarm/dashboard bind to
+                # live data.
+                if latest.get('drifted_columns_share'):
                     metrics_to_publish.append({
-                        'MetricName': 'DataDriftPSI',
-                        'Value': float(latest['data_drift_score']),
+                        'MetricName': 'DriftedColumnsShare',
+                        'Value': float(latest['drifted_columns_share']),
                         'Unit': 'None',
                         'Timestamp': datetime.now(timezone.utc)
                     })
@@ -189,12 +192,16 @@ def create_cloudwatch_monitoring(
 
     alarms_created = []
 
-    # Data Drift Alarm: PSI > threshold
+    # Data Drift Alarm: share of drifted columns > threshold.
+    # `psi_threshold` is kept as the parameter name for CLI backward
+    # compatibility (main.py passes it), but the metric is now the bounded
+    # drifted-columns share (0..1) the drift Lambda publishes — not PSI.
+    # Higher = more drift, so GreaterThanThreshold is the correct direction.
     try:
         cw_client.put_metric_alarm(
-            AlarmName='FraudDetection-DataDrift-PSI',
-            AlarmDescription=f'Data drift detected: Average PSI exceeds {psi_threshold} (significant distribution shift)',
-            MetricName='DataDriftPSI',
+            AlarmName='FraudDetection-DataDrift-Share',
+            AlarmDescription=f'Data drift detected: share of drifted columns exceeds {psi_threshold}',
+            MetricName='DriftedColumnsShare',
             Namespace=NAMESPACE,
             Statistic='Average',
             Period=300,
@@ -203,36 +210,35 @@ def create_cloudwatch_monitoring(
             ComparisonOperator='GreaterThanThreshold',
             Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
         )
-        alarms_created.append(f'FraudDetection-DataDrift-PSI (threshold: PSI > {psi_threshold})')
+        alarms_created.append(f'FraudDetection-DataDrift-Share (threshold: share > {psi_threshold})')
     except Exception as e:
-        print(f"  ⚠ Failed to create PSI alarm: {e}")
+        print(f"  ⚠ Failed to create data-drift alarm: {e}")
 
-    # Model Drift Alarms
-    model_drift_alarms = {
-        'ROCAUCDegradation': f'Model drift: ROC-AUC degradation exceeds {drift_threshold*100:.0f}%',
-        'Accuracy': f'Model drift: Accuracy degradation exceeds {drift_threshold*100:.0f}%',
-        'Precision': f'Model drift: Precision degradation exceeds {drift_threshold*100:.0f}%',
-        'Recall': f'Model drift: Recall degradation exceeds {drift_threshold*100:.0f}%',
-    }
-
-    for metric_name, description in model_drift_alarms.items():
-        alarm_name = f'FraudDetection-ModelDrift-{metric_name.replace("_", "-").upper()}'
-        try:
-            cw_client.put_metric_alarm(
-                AlarmName=alarm_name,
-                AlarmDescription=description,
-                MetricName=metric_name,
-                Namespace=NAMESPACE,
-                Statistic='Average',
-                Period=300,
-                EvaluationPeriods=evaluation_periods,
-                Threshold=drift_threshold,
-                ComparisonOperator='GreaterThanThreshold',
-                Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
-            )
-            alarms_created.append(f'{alarm_name} (threshold: > {drift_threshold*100:.0f}%)')
-        except Exception as e:
-            print(f"  ⚠ Failed to create {alarm_name}: {e}")
+    # Model Drift Alarm: ROC-AUC degradation from baseline > threshold.
+    #
+    # Only ROCAUCDegradation is alarmed here. The former Accuracy/Precision/
+    # Recall alarms compared ABSOLUTE metric values (~0.8–0.9) with
+    # GreaterThanThreshold(0.10), so they fired on every publish — a
+    # false-positive by construction. ROCAUCDegradation is a "bad = high"
+    # metric (points of ROC-AUC lost vs. baseline), so GreaterThanThreshold
+    # is the correct, meaningful comparison. Accuracy/Precision/Recall are
+    # still plotted on the dashboard below as absolute-value time series.
+    try:
+        cw_client.put_metric_alarm(
+            AlarmName='FraudDetection-ModelDrift-ROCAUCDegradation',
+            AlarmDescription=f'Model drift: ROC-AUC degradation from baseline exceeds {drift_threshold*100:.0f}%',
+            MetricName='ROCAUCDegradation',
+            Namespace=NAMESPACE,
+            Statistic='Average',
+            Period=300,
+            EvaluationPeriods=evaluation_periods,
+            Threshold=drift_threshold,
+            ComparisonOperator='GreaterThanThreshold',
+            Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
+        )
+        alarms_created.append(f'FraudDetection-ModelDrift-ROCAUCDegradation (threshold: > {drift_threshold})')
+    except Exception as e:
+        print(f"  ⚠ Failed to create ROC-AUC degradation alarm: {e}")
 
     print(f"  ✓ Created {len(alarms_created)} alarms")
 
@@ -258,12 +264,12 @@ def create_cloudwatch_monitoring(
                 "x": 0, "y": 2, "width": 12, "height": 6,
                 "properties": {
                     "metrics": [
-                        [NAMESPACE, "DataDriftPSI", "Endpoint", endpoint_name, {"stat": "Average"}]
+                        [NAMESPACE, "DriftedColumnsShare", "Endpoint", endpoint_name, {"stat": "Average"}]
                     ],
                     "view": "timeSeries",
                     "stacked": False,
                     "region": region,
-                    "title": "Data Drift - Population Stability Index (PSI)",
+                    "title": "Data Drift - Share of Drifted Columns",
                     "period": 300,
                     "yAxis": {"left": {"min": 0, "max": 1}},
                     "annotations": {
@@ -278,35 +284,47 @@ def create_cloudwatch_monitoring(
                 "x": 12, "y": 2, "width": 12, "height": 6,
                 "properties": {
                     "metrics": [
-                        [NAMESPACE, "ROCAUCDegradation", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC Degradation"}],
-                        [NAMESPACE, "Accuracy", "Endpoint", endpoint_name, {"stat": "Average", "label": "Accuracy Degradation"}],
-                        [NAMESPACE, "Precision", "Endpoint", endpoint_name, {"stat": "Average", "label": "Precision Degradation"}],
-                        [NAMESPACE, "Recall", "Endpoint", endpoint_name, {"stat": "Average", "label": "Recall Degradation"}],
+                        [NAMESPACE, "CurrentROCAUC", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC"}],
+                        [NAMESPACE, "Accuracy", "Endpoint", endpoint_name, {"stat": "Average", "label": "Accuracy"}],
+                        [NAMESPACE, "Precision", "Endpoint", endpoint_name, {"stat": "Average", "label": "Precision"}],
+                        [NAMESPACE, "Recall", "Endpoint", endpoint_name, {"stat": "Average", "label": "Recall"}],
                     ],
                     "view": "timeSeries",
                     "stacked": False,
                     "region": region,
-                    "title": f"Model Drift - Degradation from Baseline ({drift_threshold*100:.0f}% alarm threshold)",
+                    "title": "Model Quality - Absolute Metrics (higher = better)",
+                    "period": 300,
+                    "yAxis": {"left": {"min": 0, "max": 1}},
+                }
+            },
+            {
+                "type": "metric",
+                "x": 0, "y": 8, "width": 12, "height": 6,
+                "properties": {
+                    "metrics": [
+                        [NAMESPACE, "ROCAUCDegradation", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC Degradation from Baseline"}],
+                    ],
+                    "view": "timeSeries",
+                    "stacked": False,
+                    "region": region,
+                    "title": f"Model Drift - ROC-AUC Degradation ({drift_threshold*100:.0f}% alarm threshold)",
                     "period": 300,
                     "yAxis": {"left": {"min": 0, "max": 0.5}},
                     "annotations": {
                         "horizontal": [
-                            {"label": f"{drift_threshold*100:.0f}% Alarm Threshold", "value": drift_threshold, "color": "#d62728"}
+                            {"label": f"{drift_threshold*100:.0f}% Alarm Threshold", "value": drift_threshold, "fill": "above", "color": "#d62728"}
                         ]
                     }
                 }
             },
             {
                 "type": "alarm",
-                "x": 0, "y": 8, "width": 24, "height": 4,
+                "x": 12, "y": 8, "width": 12, "height": 6,
                 "properties": {
                     "title": "Drift Alarms Status",
                     "alarms": [
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-DataDrift-PSI",
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-ROCAUCDEGRADATION",
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-ACCURACY",
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-PRECISION",
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-RECALL",
+                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-DataDrift-Share",
+                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-ROCAUCDegradation",
                     ]
                 }
             }

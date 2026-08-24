@@ -171,3 +171,108 @@ def test_auxiliary_columns_defaults_to_empty_list_when_omitted(tmp_path, monkeyp
     _use_temp_schema(monkeypatch, _write_schema_yaml(tmp_path, dataset))
 
     assert schema.auxiliary_columns() == []
+
+
+# ---------------------------------------------------------------------------
+# problem_type() — drives which metrics/preset the model-quality monitor uses
+# ---------------------------------------------------------------------------
+
+
+def _base_dataset(**overrides: Any) -> Dict[str, Any]:
+    dataset = {
+        "identifier_column": "row_id",
+        "timestamp_column": "event_time",
+        "target_column": "label",
+        "features": [{"name": "f1", "type": "double"}],
+    }
+    dataset.update(overrides)
+    return dataset
+
+
+def test_problem_type_defaults_to_binary_for_checked_in_boolean_target(monkeypatch):
+    # The checked-in YAML declares a boolean target with no explicit
+    # problem_type — a boolean target must resolve to binary_classification,
+    # preserving the historical drift-monitor behavior.
+    monkeypatch.delenv("PROBLEM_TYPE", raising=False)
+    assert schema.problem_type() == "binary_classification"
+
+
+def test_problem_type_env_var_takes_precedence(tmp_path, monkeypatch):
+    # Even with a boolean target that would infer binary, the env override wins.
+    _use_temp_schema(monkeypatch, _write_schema_yaml(tmp_path, _base_dataset(target_type="boolean")))
+    monkeypatch.setenv("PROBLEM_TYPE", "regression")
+    assert schema.problem_type() == "regression"
+
+
+def test_problem_type_env_var_accepts_shorthand(tmp_path, monkeypatch):
+    _use_temp_schema(monkeypatch, _write_schema_yaml(tmp_path, _base_dataset()))
+    monkeypatch.setenv("PROBLEM_TYPE", "multiclass")
+    assert schema.problem_type() == "multiclass_classification"
+
+
+def test_problem_type_env_var_is_case_insensitive(tmp_path, monkeypatch):
+    _use_temp_schema(monkeypatch, _write_schema_yaml(tmp_path, _base_dataset()))
+    monkeypatch.setenv("PROBLEM_TYPE", "  Regression  ")
+    assert schema.problem_type() == "regression"
+
+
+def test_problem_type_invalid_env_var_falls_through_to_inference(tmp_path, monkeypatch):
+    # An unrecognized env value is ignored (not honored, not crashing), so
+    # resolution falls through to the schema / target_type inference below.
+    _use_temp_schema(monkeypatch, _write_schema_yaml(tmp_path, _base_dataset(target_type="float")))
+    monkeypatch.setenv("PROBLEM_TYPE", "not-a-real-type")
+    assert schema.problem_type() == "regression"
+
+
+def test_problem_type_explicit_yaml_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("PROBLEM_TYPE", raising=False)
+    _use_temp_schema(
+        monkeypatch,
+        _write_schema_yaml(tmp_path, _base_dataset(problem_type="multiclass_classification")),
+    )
+    assert schema.problem_type() == "multiclass_classification"
+
+
+def test_problem_type_explicit_yaml_key_beats_target_type_inference(tmp_path, monkeypatch):
+    # A float target_type would infer regression, but an explicit problem_type
+    # key overrides the inference.
+    monkeypatch.delenv("PROBLEM_TYPE", raising=False)
+    _use_temp_schema(
+        monkeypatch,
+        _write_schema_yaml(
+            tmp_path, _base_dataset(target_type="float", problem_type="binary")
+        ),
+    )
+    assert schema.problem_type() == "binary_classification"
+
+
+@pytest.mark.parametrize(
+    "target_type,expected",
+    [
+        ("boolean", "binary_classification"),
+        ("bool", "binary_classification"),
+        ("float", "regression"),
+        ("double", "regression"),
+        ("numeric", "regression"),
+        ("real", "regression"),
+        ("continuous", "regression"),
+        ("categorical", "multiclass_classification"),
+        ("string", "multiclass_classification"),
+        ("multiclass", "multiclass_classification"),
+        # int is the fraud reference's 0/1 label — must default to binary,
+        # NOT regression, or an existing integer-labelled deployment flips
+        # to the wrong metric path.
+        ("int", "binary_classification"),
+        ("integer", "binary_classification"),
+        # Unrecognized types fall back conservatively to binary.
+        ("something_weird", "binary_classification"),
+    ],
+)
+def test_problem_type_inferred_from_target_type(
+    tmp_path, monkeypatch, target_type, expected
+):
+    monkeypatch.delenv("PROBLEM_TYPE", raising=False)
+    _use_temp_schema(
+        monkeypatch, _write_schema_yaml(tmp_path, _base_dataset(target_type=target_type))
+    )
+    assert schema.problem_type() == expected
