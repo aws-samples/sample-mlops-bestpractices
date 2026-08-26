@@ -1425,6 +1425,20 @@ Resources:
   # ====================================================================
   # SQS Queue + Lambda for Inference Logging
   # ====================================================================
+  # Dead-letter queue for inference-logging messages that fail every attempt
+  # (poison records, or Athena persistently rejecting the write). Without this
+  # a failed message would be silently dropped after MessageRetentionPeriod.
+  InferenceLoggingDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${ProjectName}-inference-logging-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days — max, so failures are inspectable
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-inference-logging-dlq'
+
   InferenceLoggingQueue:
     Type: AWS::SQS::Queue
     DeletionPolicy: Delete
@@ -1433,6 +1447,12 @@ Resources:
       QueueName: !Sub '${ProjectName}-inference-logging'
       VisibilityTimeout: 300
       MessageRetentionPeriod: 86400
+      # Redrive to the DLQ after 5 failed receives so a poison record can't
+      # loop forever; ReportBatchItemFailures (below) ensures only the actually
+      # failed records are retried, not the whole batch.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InferenceLoggingDLQ.Arn
+        maxReceiveCount: 5
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-inference-logging-queue'
@@ -1458,9 +1478,24 @@ Resources:
         ZipFile: |
           """
           Lambda consumer: reads inference logs from SQS and writes to Athena Iceberg table.
+
+          Reliability contract:
+            * Each record is parsed independently; a malformed body or a record
+              missing its inference_id primary key is reported as an individual
+              batch item failure (ReportBatchItemFailures) rather than poisoning
+              the whole batch.
+            * Persistence uses an idempotent MERGE keyed on inference_id, so
+              SQS at-least-once redelivery of an already-written record is a
+              no-op instead of a duplicate row.
+            * The Athena query is polled to a terminal state; only when it
+              reaches SUCCEEDED are the batch's records treated as durably
+              persisted. If it FAILS/CANCELS or times out, every attempted
+              record is returned as a batch item failure so SQS redelivers them
+              (and eventually redrives to the DLQ after maxReceiveCount).
           """
           import json
           import os
+          import time
           import boto3
 
           ATHENA_DATABASE = os.getenv('ATHENA_DATABASE', 'fraud_detection')
@@ -1473,11 +1508,14 @@ Resources:
               ('model_version', 'varchar'),
               ('mlflow_run_id', 'varchar'),
               ('input_features', 'varchar'),
-              ('prediction', 'integer'),
+              # double (not integer) so regression predictions/targets don't
+              # truncate; binary 0/1 labels round-trip losslessly. Table type
+              # must match create_athena_tables.py inference_responses DDL.
+              ('prediction', 'double'),
               ('probability_fraud', 'double'),
               ('probability_non_fraud', 'double'),
               ('confidence_score', 'double'),
-              ('ground_truth', 'integer'),
+              ('ground_truth', 'double'),
               ('ground_truth_timestamp', 'timestamp'),
               ('ground_truth_source', 'varchar'),
               ('days_to_ground_truth', 'double'),
@@ -1510,34 +1548,90 @@ Resources:
                   return f"TIMESTAMP '{s.replace('T', ' ')}'"
               return f"'{s.replace(chr(39), chr(39)+chr(39))}'"
 
+          def _run_athena_to_terminal(athena, query, context):
+              """Start a query and poll until it reaches a terminal state.
+
+              Returns the terminal state string ('SUCCEEDED'/'FAILED'/'CANCELLED').
+              Bounds polling by the Lambda's remaining time: if we would run out
+              of time, returns 'TIMED_OUT' so the caller fails the batch rather
+              than letting the invocation die mid-poll with no response."""
+              resp = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': ATHENA_DATABASE},
+                  ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_S3},
+              )
+              qid = resp['QueryExecutionId']
+              while True:
+                  # Leave a safety margin so we always return a response.
+                  if context is not None and context.get_remaining_time_in_millis() < 5000:
+                      return 'TIMED_OUT'
+                  state = athena.get_query_execution(
+                      QueryExecutionId=qid
+                  )['QueryExecution']['Status']['State']
+                  if state in ('SUCCEEDED', 'FAILED', 'CANCELLED'):
+                      return state
+                  time.sleep(0.5)
+
           def lambda_handler(event, context):
               athena = boto3.client('athena')
 
-              records = []
+              # Parse each record independently. A malformed body or one missing
+              # the inference_id primary key is an individual failure, not a
+              # batch poison. Dedup within the batch by inference_id (last wins)
+              # so the MERGE source never has two rows for one key.
+              batch_item_failures = []
+              parsed = {}  # inference_id -> record
+              attempted_ids = []  # SQS messageIds contributing to the MERGE
               for sqs_record in event.get('Records', []):
-                  body = json.loads(sqs_record['body'])
-                  records.append(body)
+                  mid = sqs_record.get('messageId')
+                  try:
+                      body = json.loads(sqs_record['body'])
+                      inf_id = body.get('inference_id')
+                      if not inf_id:
+                          raise ValueError('record missing inference_id')
+                  except Exception as e:
+                      print(f"Malformed inference record {mid}: {e}")
+                      batch_item_failures.append({'itemIdentifier': mid})
+                      continue
+                  parsed[str(inf_id)] = body
+                  attempted_ids.append(mid)
 
-              if not records:
-                  return {'statusCode': 200, 'body': 'No records'}
+              if not parsed:
+                  return {'batchItemFailures': batch_item_failures}
 
+              col_names = [c[0] for c in COLUMNS]
               rows = []
-              for r in records:
+              for r in parsed.values():
                   row = ", ".join(
                       sql_val(r.get(col_name), col_type)
                       for col_name, col_type in COLUMNS
                   )
                   rows.append(f"({row})")
 
-              query = f"INSERT INTO {ATHENA_DATABASE}.inference_responses VALUES\n" + ",\n".join(rows)
-
-              athena.start_query_execution(
-                  QueryString=query,
-                  QueryExecutionContext={'Database': ATHENA_DATABASE},
-                  ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_S3},
+              col_list = ", ".join(col_names)
+              src_cols = ", ".join(f"s.{c}" for c in col_names)
+              # Idempotent MERGE keyed on inference_id: at-least-once redelivery of
+              # an already-persisted record matches an existing row and is skipped.
+              query = (
+                  f"MERGE INTO {ATHENA_DATABASE}.inference_responses AS t\n"
+                  f"USING (SELECT * FROM (VALUES\n" + ",\n".join(rows) + "\n"
+                  f") AS v({col_list})) AS s\n"
+                  f"ON t.inference_id = s.inference_id\n"
+                  f"WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({src_cols})"
               )
 
-              return {'statusCode': 200, 'body': f'Inserted {len(records)} records'}
+              state = _run_athena_to_terminal(athena, query, context)
+              if state != 'SUCCEEDED':
+                  # The write did not commit — fail every attempted record so SQS
+                  # redelivers them (and redrives to the DLQ after maxReceiveCount).
+                  print(f"Inference MERGE did not succeed (state={state}); failing "
+                        f"{len(attempted_ids)} record(s) for redelivery")
+                  for mid in attempted_ids:
+                      batch_item_failures.append({'itemIdentifier': mid})
+                  return {'batchItemFailures': batch_item_failures}
+
+              print(f"Persisted {len(parsed)} inference record(s)")
+              return {'batchItemFailures': batch_item_failures}
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-inference-logger'
@@ -1549,6 +1643,10 @@ Resources:
       FunctionName: !Ref InferenceLoggerFunction
       BatchSize: 10
       MaximumBatchingWindowInSeconds: 30
+      # Honor the handler's batchItemFailures response so only the records that
+      # actually failed are redelivered instead of the whole batch.
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
 
 Outputs:
   SageMakerDomainId:

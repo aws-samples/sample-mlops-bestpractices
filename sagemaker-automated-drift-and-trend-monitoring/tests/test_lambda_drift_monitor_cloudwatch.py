@@ -114,10 +114,38 @@ def test_publish_regression_metrics_skips_none_classification(mock_cloudwatch):
     assert published["MAE"] == 3.2
     assert published["RMSE"] == 4.1
     assert published["R2"] == 0.78
-    assert published["ROCAUCDegradation"] == 1.5
     assert published["ModelDriftDetected"] == 1
+    # A regression `degradation` is an RMSE INCREASE, not a ROC-AUC drop — it
+    # must NOT be republished under the ROC-AUC-named metric. ROC-AUC metrics are
+    # binary-only.
+    assert "ROCAUCDegradation" not in published
     # None classification metrics must be dropped, not sent as None/NaN.
     for skipped in ("BaselineROCAUC", "CurrentROCAUC", "Accuracy", "Precision", "Recall"):
+        assert skipped not in published
+
+
+def test_publish_multiclass_omits_roc_auc_named_metrics(mock_cloudwatch):
+    # Multiclass has no single-probability ROC-AUC; its degradation is an
+    # accuracy drop. None of the ROC-AUC-named metrics should be published.
+    model_drift = {
+        "problem_type": "multiclass_classification",
+        "primary_metric": "accuracy",
+        "baseline_roc_auc": None,
+        "current_roc_auc": None,
+        "accuracy": 0.80,
+        "precision": 0.78,
+        "recall": 0.75,
+        "degradation": 0.10,
+        "degradation_pct": 11.1,
+        "detected": True,
+    }
+    ldm.publish_cloudwatch_metrics(None, model_drift)
+    published = _published_metric_names(mock_cloudwatch)
+
+    assert published["Accuracy"] == 0.80
+    # Primary degradation still surfaces under the generic normalized metric.
+    assert round(published["PrimaryMetricDegradationRatio"], 5) == round(0.111, 5)
+    for skipped in ("BaselineROCAUC", "CurrentROCAUC", "ROCAUCDegradation"):
         assert skipped not in published
 
 
@@ -139,9 +167,15 @@ def test_publish_skips_non_finite_values(mock_cloudwatch):
     assert published["Accuracy"] == 0.9
 
 
-def test_publish_with_no_results_returns_zero(mock_cloudwatch):
-    assert ldm.publish_cloudwatch_metrics(None, None) == 0
-    mock_cloudwatch.put_metric_data.assert_not_called()
+def test_publish_with_no_results_still_emits_heartbeat(mock_cloudwatch):
+    # A run that scored nothing (empty/thin window) must still emit the
+    # DriftRunExecuted heartbeat so the schedule-stall alarm can tell a
+    # no-data run apart from a Lambda that never fired. Only the heartbeat
+    # is published in that case.
+    assert ldm.publish_cloudwatch_metrics(None, None) == 1
+    mock_cloudwatch.put_metric_data.assert_called_once()
+    published = _published_metric_names(mock_cloudwatch)
+    assert published == {"DriftRunExecuted": 1}
 
 
 def test_publish_never_raises_on_cloudwatch_error(mock_cloudwatch):

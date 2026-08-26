@@ -62,24 +62,41 @@ def create_cloudwatch_monitoring(
     MONITORING_TABLE = os.getenv('MONITORING_TABLE_NAME', 'monitoring_responses')
     DATA_S3_BUCKET = os.getenv('DATA_S3_BUCKET', f'fraud-detection-data-lake-skoppar-{account_id}')
 
+    # SNS topic ARN for alarm actions. Resolved the same way the rest of the
+    # codebase does (manage_drift_lambda.py / config.py): accept an explicit
+    # SNS_TOPIC_ARN if provided, otherwise construct it from SNS_TOPIC_NAME
+    # (default matches the CFN SnsTopicName default 'fraud-detection-drift-alerts')
+    # plus region + account. The CFN alarms wire AlarmActions to this topic, so
+    # the imperative path must do the same to reach parity.
+    SNS_TOPIC_NAME = os.getenv('SNS_TOPIC_NAME', 'fraud-detection-drift-alerts')
+    SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN') or f'arn:aws:sns:{region}:{account_id}:{SNS_TOPIC_NAME}'
+    print(f"  SNS Topic ARN (alarm actions): {SNS_TOPIC_ARN}")
+    print("")
+
     # Step 1: Get latest drift metrics from monitoring_responses table
     print("[1/3] Fetching latest drift metrics from Athena...")
 
     try:
         athena = boto3.client('athena', region_name=region)
+        # Column names must match the authoritative monitoring_responses DDL
+        # (src/setup/create_athena_tables.py): monitoring_timestamp,
+        # roc_auc_degradation, precision (not timestamp/degradation/
+        # precision_score). Filter to THIS endpoint so we never publish another
+        # endpoint's latest row under this endpoint's CloudWatch dimension. The
+        # table is PARTITIONED BY day(monitoring_timestamp); order by it DESC.
         query = f"""
         SELECT
-            timestamp,
+            monitoring_timestamp,
             drifted_columns_share,
             baseline_roc_auc,
             current_roc_auc,
-            degradation,
+            roc_auc_degradation,
             accuracy,
-            precision_score,
+            precision,
             recall
         FROM {ATHENA_DATABASE}.{MONITORING_TABLE}
-        WHERE timestamp IS NOT NULL
-        ORDER BY timestamp DESC
+        WHERE endpoint_name = '{endpoint_name}'
+        ORDER BY monitoring_timestamp DESC
         LIMIT 1
         """
 
@@ -116,7 +133,7 @@ def create_cloudwatch_monitoring(
 
             if results:
                 latest = results[0]
-                print(f"  ✓ Found latest metrics from {latest.get('timestamp', 'N/A')}")
+                print(f"  ✓ Found latest metrics from {latest.get('monitoring_timestamp', 'N/A')}")
 
                 # Publish metrics to CloudWatch
                 metrics_to_publish = []
@@ -137,7 +154,7 @@ def create_cloudwatch_monitoring(
                 if latest.get('baseline_roc_auc') and latest.get('current_roc_auc'):
                     baseline = float(latest['baseline_roc_auc'])
                     current = float(latest['current_roc_auc'])
-                    degradation = float(latest.get('degradation', 0))
+                    degradation = float(latest.get('roc_auc_degradation', 0))
 
                     metrics_to_publish.extend([
                         {'MetricName': 'BaselineROCAUC', 'Value': baseline, 'Unit': 'None'},
@@ -152,10 +169,10 @@ def create_cloudwatch_monitoring(
                         'Unit': 'None'
                     })
 
-                if latest.get('precision_score'):
+                if latest.get('precision'):
                     metrics_to_publish.append({
                         'MetricName': 'Precision',
-                        'Value': float(latest['precision_score']),
+                        'Value': float(latest['precision']),
                         'Unit': 'None'
                     })
 
@@ -197,10 +214,26 @@ def create_cloudwatch_monitoring(
     # compatibility (main.py passes it), but the metric is now the bounded
     # drifted-columns share (0..1) the drift Lambda publishes — not PSI.
     # Higher = more drift, so GreaterThanThreshold is the correct direction.
+    #
+    # EARLY-WARNING TIER (finding M1) — INTENTIONAL, DO NOT "fix" the gap:
+    # This CloudWatch alarm trips at psi_threshold (default 0.20 = 20% of
+    # columns drifted), which is deliberately BELOW the 0.50 (50%) share at
+    # which the Evidently run's OVERALL drift VERDICT flips to drift-detected
+    # (DRIFT_SHARE_THRESHOLD = 0.5 in evidently_reports.py) and fires the SNS
+    # alert / DataDriftDetected. Consequence, by design: this CloudWatch alarm
+    # can be in ALARM (RED) while the run's SNS alert / DataDriftDetected still
+    # report no-drift, because 20% <= share < 50%. CloudWatch is the leading
+    # early-warning signal; SNS/DataDriftDetected is the confirmed verdict.
+    #
+    # Alarm NAME is 'FraudDetection-DataDrift-PSI' to match the CloudFormation
+    # DataDriftPsiAlarm (cloudformation/drift-monitoring-infra.yaml) so both the
+    # imperative and CFN setup paths produce the SAME alarm. TreatMissingData is
+    # notBreaching (a missing metric is not, by itself, data drift) and
+    # AlarmActions notify the SNS topic, matching CFN.
     try:
         cw_client.put_metric_alarm(
-            AlarmName='FraudDetection-DataDrift-Share',
-            AlarmDescription=f'Data drift detected: share of drifted columns exceeds {psi_threshold}',
+            AlarmName='FraudDetection-DataDrift-PSI',
+            AlarmDescription=f'Data drift early-warning: share of drifted columns exceeds {psi_threshold}.',
             MetricName='DriftedColumnsShare',
             Namespace=NAMESPACE,
             Statistic='Average',
@@ -208,37 +241,84 @@ def create_cloudwatch_monitoring(
             EvaluationPeriods=evaluation_periods,
             Threshold=psi_threshold,
             ComparisonOperator='GreaterThanThreshold',
+            TreatMissingData='notBreaching',
             Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
+            AlarmActions=[SNS_TOPIC_ARN],
         )
-        alarms_created.append(f'FraudDetection-DataDrift-Share (threshold: share > {psi_threshold})')
+        alarms_created.append(f'FraudDetection-DataDrift-PSI (threshold: share > {psi_threshold})')
     except Exception as e:
         print(f"  ⚠ Failed to create data-drift alarm: {e}")
 
-    # Model Drift Alarm: ROC-AUC degradation from baseline > threshold.
+    # Model Drift Alarm: RELATIVE degradation of the primary metric > threshold.
     #
-    # Only ROCAUCDegradation is alarmed here. The former Accuracy/Precision/
-    # Recall alarms compared ABSOLUTE metric values (~0.8–0.9) with
-    # GreaterThanThreshold(0.10), so they fired on every publish — a
-    # false-positive by construction. ROCAUCDegradation is a "bad = high"
-    # metric (points of ROC-AUC lost vs. baseline), so GreaterThanThreshold
-    # is the correct, meaningful comparison. Accuracy/Precision/Recall are
+    # Alarms on PrimaryMetricDegradationRatio — the RELATIVE fraction the drift
+    # Lambda publishes (value = degradation_pct/100, e.g. 0.10 == 10% relative
+    # degradation from baseline). This matches drift_threshold's semantics (a
+    # percentage), unlike the old ROCAUCDegradation metric which carried an
+    # ABSOLUTE ROC-AUC delta and was inconsistent with a percentage threshold.
+    # The primary metric is ROC-AUC for classification and RMSE for regression,
+    # so the ratio is task-agnostic. Ratio is "bad = high", so
+    # GreaterThanThreshold is the correct direction.
+    #
+    # The alarm NAME is 'FraudDetection-ModelDrift-ROCAUCDEGRADATION' (all-caps
+    # DEGRADATION) to match the CloudFormation ModelDriftRocAucAlarm — the CFN
+    # spelling is authoritative, so the imperative path adopts it (was
+    # ...-ROCAUCDegradation here). The dashboard alarm-status widget below
+    # references this exact name. Only the casing changed; MetricName is
+    # PrimaryMetricDegradationRatio. TreatMissingData notBreaching + AlarmActions
+    # to SNS mirror CFN.
+    #
+    # The former Accuracy/Precision/Recall alarms compared ABSOLUTE metric
+    # values (~0.8–0.9) with GreaterThanThreshold(0.10), so they fired on every
+    # publish — a false-positive by construction. Accuracy/Precision/Recall are
     # still plotted on the dashboard below as absolute-value time series.
     try:
         cw_client.put_metric_alarm(
-            AlarmName='FraudDetection-ModelDrift-ROCAUCDegradation',
-            AlarmDescription=f'Model drift: ROC-AUC degradation from baseline exceeds {drift_threshold*100:.0f}%',
-            MetricName='ROCAUCDegradation',
+            AlarmName='FraudDetection-ModelDrift-ROCAUCDEGRADATION',
+            AlarmDescription=f'Model drift: relative degradation of the primary metric (ROC-AUC / accuracy / RMSE) from baseline exceeds {drift_threshold*100:.0f}%.',
+            MetricName='PrimaryMetricDegradationRatio',
             Namespace=NAMESPACE,
             Statistic='Average',
             Period=300,
             EvaluationPeriods=evaluation_periods,
             Threshold=drift_threshold,
             ComparisonOperator='GreaterThanThreshold',
+            TreatMissingData='notBreaching',
             Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
+            AlarmActions=[SNS_TOPIC_ARN],
         )
-        alarms_created.append(f'FraudDetection-ModelDrift-ROCAUCDegradation (threshold: > {drift_threshold})')
+        alarms_created.append(f'FraudDetection-ModelDrift-ROCAUCDEGRADATION (threshold: > {drift_threshold})')
     except Exception as e:
         print(f"  ⚠ Failed to create ROC-AUC degradation alarm: {e}")
+
+    # Heartbeat / no-data alarm: the drift Lambda emits DriftRunExecuted=1 on
+    # EVERY scheduled run (including no-data runs). Its ABSENCE over the rolling
+    # ~25h window (one daily run + slack) means the schedule stalled. Statistic
+    # Sum + LessThanThreshold(1) + TreatMissingData=breaching fires when no
+    # heartbeat arrived. Matches the CFN DriftMonitorHeartbeatAlarm exactly:
+    # a rolling ~25h window built from Period 3600s × 25 consecutive missing
+    # datapoints, so a missed daily run is detected within ~1h of the 25h mark
+    # instead of up to ~50h with a single fixed 90000s period boundary. This is
+    # the alarm the imperative path was missing entirely.
+    try:
+        cw_client.put_metric_alarm(
+            AlarmName='FraudDetection-DriftMonitor-NoHeartbeat',
+            AlarmDescription='The scheduled drift monitor has not run (no DriftRunExecuted heartbeat) in the expected window.',
+            MetricName='DriftRunExecuted',
+            Namespace=NAMESPACE,
+            Statistic='Sum',
+            Period=3600,             # rolling 25h window = 3600s × 25 datapoints
+            EvaluationPeriods=25,
+            DatapointsToAlarm=25,
+            Threshold=1,
+            ComparisonOperator='LessThanThreshold',
+            TreatMissingData='breaching',
+            Dimensions=[{'Name': 'Endpoint', 'Value': endpoint_name}],
+            AlarmActions=[SNS_TOPIC_ARN],
+        )
+        alarms_created.append('FraudDetection-DriftMonitor-NoHeartbeat (fires if no run in ~25h)')
+    except Exception as e:
+        print(f"  ⚠ Failed to create heartbeat alarm: {e}")
 
     print(f"  ✓ Created {len(alarms_created)} alarms")
 
@@ -284,30 +364,13 @@ def create_cloudwatch_monitoring(
                 "x": 12, "y": 2, "width": 12, "height": 6,
                 "properties": {
                     "metrics": [
-                        [NAMESPACE, "CurrentROCAUC", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC"}],
-                        [NAMESPACE, "Accuracy", "Endpoint", endpoint_name, {"stat": "Average", "label": "Accuracy"}],
-                        [NAMESPACE, "Precision", "Endpoint", endpoint_name, {"stat": "Average", "label": "Precision"}],
-                        [NAMESPACE, "Recall", "Endpoint", endpoint_name, {"stat": "Average", "label": "Recall"}],
+                        [NAMESPACE, "PrimaryMetricDegradationRatio", "Endpoint", endpoint_name, {"stat": "Average", "label": "Primary Metric Degradation (relative)"}],
+                        [NAMESPACE, "ROCAUCDegradation", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC Degradation (absolute, binary)"}],
                     ],
                     "view": "timeSeries",
                     "stacked": False,
                     "region": region,
-                    "title": "Model Quality - Absolute Metrics (higher = better)",
-                    "period": 300,
-                    "yAxis": {"left": {"min": 0, "max": 1}},
-                }
-            },
-            {
-                "type": "metric",
-                "x": 0, "y": 8, "width": 12, "height": 6,
-                "properties": {
-                    "metrics": [
-                        [NAMESPACE, "ROCAUCDegradation", "Endpoint", endpoint_name, {"stat": "Average", "label": "ROC-AUC Degradation from Baseline"}],
-                    ],
-                    "view": "timeSeries",
-                    "stacked": False,
-                    "region": region,
-                    "title": f"Model Drift - ROC-AUC Degradation ({drift_threshold*100:.0f}% alarm threshold)",
+                    "title": "Model Drift - Degradation from Baseline",
                     "period": 300,
                     "yAxis": {"left": {"min": 0, "max": 0.5}},
                     "annotations": {
@@ -318,13 +381,33 @@ def create_cloudwatch_monitoring(
                 }
             },
             {
+                "type": "metric",
+                "x": 0, "y": 8, "width": 12, "height": 6,
+                "properties": {
+                    "metrics": [
+                        [NAMESPACE, "Accuracy", "Endpoint", endpoint_name, {"stat": "Average", "label": "Accuracy"}],
+                        [NAMESPACE, "Precision", "Endpoint", endpoint_name, {"stat": "Average", "label": "Precision"}],
+                        [NAMESPACE, "Recall", "Endpoint", endpoint_name, {"stat": "Average", "label": "Recall"}],
+                        [NAMESPACE, "CurrentROCAUC", "Endpoint", endpoint_name, {"stat": "Average", "label": "Current ROC-AUC"}],
+                        [NAMESPACE, "BaselineROCAUC", "Endpoint", endpoint_name, {"stat": "Average", "label": "Baseline ROC-AUC"}],
+                    ],
+                    "view": "timeSeries",
+                    "stacked": False,
+                    "region": region,
+                    "title": "Model Quality - Current Metrics",
+                    "period": 300,
+                    "yAxis": {"left": {"min": 0, "max": 1}},
+                }
+            },
+            {
                 "type": "alarm",
                 "x": 12, "y": 8, "width": 12, "height": 6,
                 "properties": {
                     "title": "Drift Alarms Status",
                     "alarms": [
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-DataDrift-Share",
-                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-ROCAUCDegradation",
+                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-DataDrift-PSI",
+                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-ModelDrift-ROCAUCDEGRADATION",
+                        f"arn:aws:cloudwatch:{region}:{account_id}:alarm:FraudDetection-DriftMonitor-NoHeartbeat",
                     ]
                 }
             }
@@ -357,8 +440,8 @@ def create_cloudwatch_monitoring(
     print("")
     print("Next steps:")
     print("  1. View dashboard in CloudWatch console")
-    print("  2. Configure alarm actions (SNS notifications):")
-    print(f"     aws cloudwatch put-metric-alarm --alarm-name <name> --alarm-actions <sns-topic-arn>")
+    print(f"  2. Alarm actions are wired to SNS topic: {SNS_TOPIC_ARN}")
+    print("     (subscribe an endpoint to this topic to receive notifications)")
     print("  3. Alarms will trigger when thresholds are exceeded")
     print("")
 

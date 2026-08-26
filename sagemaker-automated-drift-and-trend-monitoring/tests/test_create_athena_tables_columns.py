@@ -28,6 +28,18 @@ from src.config import schema
 from src.setup import create_athena_tables as cat
 
 
+# Tables whose columns are drift-monitor internals unrelated to the dataset
+# schema (no identifier/feature/auxiliary/target blocks): monitoring_responses
+# holds per-run verdicts, monitoring_run_inferences is the run->inference
+# membership bridge, monitoring_run_generations holds membership-completion
+# markers, and monitoring_alerts is the notification outbox. All deliberately
+# non-schema-driven, per design.md.
+NON_SCHEMA_DRIVEN_TABLES = {
+    "monitoring_responses", "monitoring_run_inferences",
+    "monitoring_run_generations", "monitoring_alerts",
+}
+
+
 class _EntityNotFoundException(Exception):
     """Stand-in for the real `glue.exceptions.EntityNotFoundException`,
     which boto3 normally generates dynamically per-client."""
@@ -90,10 +102,13 @@ def submitted_ddls(monkeypatch) -> Dict[str, str]:
     return submitted
 
 
-def test_all_seven_tables_have_ddl_submitted(submitted_ddls):
-    """Requirement 3.1: create_all_tables() creates all 7 tables."""
+def test_all_tables_have_ddl_submitted(submitted_ddls):
+    """Requirement 3.1: create_all_tables() creates every registered table
+    (the schema/monitoring tables, the monitoring_run_inferences bridge, the
+    monitoring_run_generations completion markers, and the monitoring_alerts
+    outbox)."""
     assert set(submitted_ddls.keys()) == set(cat.ALL_TABLE_NAMES)
-    assert len(cat.ALL_TABLE_NAMES) == 7
+    assert len(cat.ALL_TABLE_NAMES) == 10
 
 
 def _index_of(haystack: str, needle: str) -> Optional[int]:
@@ -141,9 +156,9 @@ def test_column_order_for_table(submitted_ddls, table_name):
     ddl = submitted_ddls[table_name]
     present_anchors = _schema_driven_anchors(ddl)
 
-    # Every schema-driven table (all but monitoring_responses) must at
-    # least declare the identifier column.
-    if table_name != "monitoring_responses":
+    # Every schema-driven table (all but the non-schema-driven monitoring
+    # tables) must at least declare the identifier column.
+    if table_name not in NON_SCHEMA_DRIVEN_TABLES:
         labels_present = {label for label, _ in present_anchors}
         assert "identifier" in labels_present, (
             f"{table_name}: expected the identifier column "

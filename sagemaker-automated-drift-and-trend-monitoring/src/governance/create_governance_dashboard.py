@@ -645,12 +645,17 @@ def create_inference_dataset(
                     # so BYO users whose inference handler emits differently
                     # named columns don't have to edit this file. Defaults
                     # match the fraud-detection reference implementation.
-                    {'Name': PREDICTION_COLUMN, 'Type': 'INTEGER'},
+                    # prediction / ground_truth are DOUBLE in Athena (see the
+                    # inference_responses DDL in src/setup/create_athena_tables.py):
+                    # regression models emit continuous values, and binary/
+                    # multiclass integer labels still round-trip losslessly
+                    # through DOUBLE — so both map to QuickSight DECIMAL here.
+                    {'Name': PREDICTION_COLUMN, 'Type': 'DECIMAL'},
                     {'Name': PROBABILITY_COLUMN, 'Type': 'DECIMAL'},
                     *([{'Name': PROBABILITY_ALT_COLUMN, 'Type': 'DECIMAL'}]
                        if PROBABILITY_ALT_COLUMN else []),
                     {'Name': 'confidence_score', 'Type': 'DECIMAL'},
-                    {'Name': 'ground_truth', 'Type': 'INTEGER'},
+                    {'Name': 'ground_truth', 'Type': 'DECIMAL'},
                     {'Name': 'ground_truth_timestamp', 'Type': 'DATETIME'},
                     {'Name': 'ground_truth_source', 'Type': 'STRING'},
                     {'Name': 'days_to_ground_truth', 'Type': 'DECIMAL'},
@@ -820,6 +825,19 @@ def create_drift_dataset(
                     {'Name': 'alert_sent', 'Type': 'BIT'},
                     {'Name': 'detection_engine', 'Type': 'STRING'},
                     {'Name': 'created_at', 'Type': 'DATETIME'},
+                    # Problem-type-aware columns (appended to monitoring_responses
+                    # DDL after created_at). The roc_auc_* / precision / recall /
+                    # f1 columns above are binary-only; these carry the generic
+                    # primary metric plus regression metrics (mae/rmse/r2) and an
+                    # explicit per-run execution_status. STRING→STRING, DOUBLE→DECIMAL.
+                    {'Name': 'problem_type', 'Type': 'STRING'},
+                    {'Name': 'primary_metric', 'Type': 'STRING'},
+                    {'Name': 'baseline_primary', 'Type': 'DECIMAL'},
+                    {'Name': 'current_primary', 'Type': 'DECIMAL'},
+                    {'Name': 'mae', 'Type': 'DECIMAL'},
+                    {'Name': 'rmse', 'Type': 'DECIMAL'},
+                    {'Name': 'r2', 'Type': 'DECIMAL'},
+                    {'Name': 'execution_status', 'Type': 'STRING'},
                 ],
             }
         }
@@ -842,13 +860,28 @@ def create_drift_dataset(
                                     "ifelse({drifted_columns_share} > 0.15, 'MEDIUM', 'LOW'))"
                                 ),
                             },
+                            # Problem-type-aware status. current_roc_auc is
+                            # binary-only (NULL for regression/multiclass), so
+                            # fall back to the generic current_primary the monitor
+                            # now writes for every problem type — binary runs still
+                            # use roc_auc (coalesce picks it first). The 0.95/0.90
+                            # bands assume a higher-is-better bounded metric
+                            # (roc_auc / accuracy / f1 / r2); for lower-is-better
+                            # regression metrics (mae/rmse) users should re-band via
+                            # `dashboard update`. execution_status surfaces
+                            # skipped/errored runs before the metric bands apply so
+                            # they don't read as 'CRITICAL'.
                             {
                                 'ColumnName': 'performance_status',
                                 'ColumnId': 'performance-status',
                                 'Expression': (
                                     "ifelse("
-                                    "{current_roc_auc} >= 0.95, 'GOOD', "
-                                    "ifelse({current_roc_auc} >= 0.90, 'WARNING', 'CRITICAL'))"
+                                    "isNull({execution_status}) = FALSE AND "
+                                    "toLower({execution_status}) <> 'success', "
+                                    "toUpper({execution_status}), "
+                                    "ifelse(coalesce({current_roc_auc}, {current_primary}) >= 0.95, 'GOOD', "
+                                    "ifelse(coalesce({current_roc_auc}, {current_primary}) >= 0.90, "
+                                    "'WARNING', 'CRITICAL')))"
                                 ),
                             },
                         ]
@@ -893,14 +926,18 @@ def create_feature_drift_dataset(
     database: Optional[str] = None,
     monitoring_table: Optional[str] = None,
     inference_table: Optional[str] = None,
+    run_inferences_table: Optional[str] = None,
 ) -> str:
     """
     Create/update the feature-drift-by-model-version joined dataset (Section 6c, dataset 1).
 
-    CustomSql joining `monitoring_responses` to `inference_responses` on
-    the exact foreign key `monitoring_run_id` (back-filled by the drift
-    Lambda on every inference row it scored) to aggregate inference counts
-    + avg fraud probability alongside per-run drift metrics.
+    CustomSql joining `monitoring_responses` to `inference_responses` THROUGH
+    the `monitoring_run_inferences` bridge (filtered to the data-drift cohort)
+    to aggregate inference counts + avg fraud probability alongside per-run
+    drift metrics. The bridge records the EXACT inference rows each run scored
+    per check, so this join reflects true cohort membership — not the legacy
+    `inference_responses.monitoring_run_id` scalar FK (now deprecated), which
+    could not represent the separate data- vs model-quality cohorts.
 
     Args:
         datasource_arn: ARN of the Athena data source
@@ -925,6 +962,7 @@ def create_feature_drift_dataset(
     resolved_database = database or ATHENA_DATABASE
     resolved_monitoring_table = monitoring_table or ATHENA_MONITORING_RESPONSES_TABLE
     resolved_inference_table = inference_table or ATHENA_INFERENCE_TABLE
+    resolved_run_inferences_table = run_inferences_table or 'monitoring_run_inferences'
 
     if quicksight_client is None:
         quicksight_client = boto3.client('quicksight', region_name=AWS_DEFAULT_REGION)
@@ -952,6 +990,18 @@ SELECT
     m.precision,
     m.recall,
     m.f1_score,
+    -- Problem-type-aware columns: binary runs still populate the roc_auc_* /
+    -- precision / recall / f1 columns above; regression/multiclass runs carry
+    -- their verdict in these generic columns instead (primary_metric +
+    -- baseline_primary/current_primary, mae/rmse/r2) plus execution_status.
+    m.problem_type,
+    m.primary_metric,
+    m.baseline_primary,
+    m.current_primary,
+    m.mae,
+    m.rmse,
+    m.r2,
+    m.execution_status,
     COUNT(DISTINCT i.inference_id) as inference_count,
     -- avg_score = AVG of the probability/score column. Aliased so the
     -- dashboard doesn't have to know the physical column name.
@@ -960,13 +1010,19 @@ SELECT
     MIN(i.request_timestamp) as window_start,
     MAX(i.request_timestamp) as window_end
 FROM {resolved_database}.{resolved_monitoring_table} m
+-- Exact-membership join THROUGH the bridge: monitoring_run_inferences records
+-- the precise inference_ids each run scored, per check_type. We take the
+-- data-drift cohort here (this dataset is about feature/data drift). This
+-- supersedes the legacy inference_responses.monitoring_run_id scalar FK — a
+-- single mutable FK could not represent the separate data- vs model-quality
+-- cohorts, and its timestamp-window backfill tagged malformed / over-limit /
+-- boundary rows that were never actually scored.
+LEFT JOIN {resolved_database}.{resolved_run_inferences_table} b
+    ON b.monitoring_run_id = m.monitoring_run_id
+   AND b.check_type = 'data_drift'
 LEFT JOIN {resolved_database}.{resolved_inference_table} i
-    -- Exact foreign-key join: the drift Lambda back-fills monitoring_run_id
-    -- on inference_responses for every row it scored. Older versions used a
-    -- 24-hour time-window approximation here, which missed rows when runs
-    -- were >24h apart and double-counted when runs overlapped.
-    ON i.monitoring_run_id = m.monitoring_run_id
-GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+    ON i.inference_id = b.inference_id
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24
 ORDER BY m.monitoring_timestamp DESC
 '''
 
@@ -993,6 +1049,16 @@ ORDER BY m.monitoring_timestamp DESC
                     {'Name': 'precision', 'Type': 'DECIMAL'},
                     {'Name': 'recall', 'Type': 'DECIMAL'},
                     {'Name': 'f1_score', 'Type': 'DECIMAL'},
+                    # Generic / regression / multiclass metrics + execution_status
+                    # (STRING→STRING, DOUBLE→DECIMAL). Order matches the SELECT.
+                    {'Name': 'problem_type', 'Type': 'STRING'},
+                    {'Name': 'primary_metric', 'Type': 'STRING'},
+                    {'Name': 'baseline_primary', 'Type': 'DECIMAL'},
+                    {'Name': 'current_primary', 'Type': 'DECIMAL'},
+                    {'Name': 'mae', 'Type': 'DECIMAL'},
+                    {'Name': 'rmse', 'Type': 'DECIMAL'},
+                    {'Name': 'r2', 'Type': 'DECIMAL'},
+                    {'Name': 'execution_status', 'Type': 'STRING'},
                     {'Name': 'inference_count', 'Type': 'INTEGER'},
                     {'Name': 'avg_fraud_prob', 'Type': 'DECIMAL'},
                     {'Name': 'gt_count', 'Type': 'INTEGER'},
@@ -1415,7 +1481,11 @@ ORDER BY i.request_timestamp DESC
                     {'Name': 'inference_id', 'Type': 'STRING'},
                     {'Name': 'endpoint_name', 'Type': 'STRING'},
                     {'Name': 'model_version', 'Type': 'STRING'},
-                    {'Name': 'predicted_fraud', 'Type': 'INTEGER'},
+                    # predicted_fraud = i.prediction, now DOUBLE in Athena (was
+                    # INT) — declared DECIMAL for parity. The binary equality
+                    # checks in the CustomSql (`i.prediction = 1`) still hold for
+                    # 0.0/1.0 labels; this dataset is binary-fraud-specific.
+                    {'Name': 'predicted_fraud', 'Type': 'DECIMAL'},
                     {'Name': 'actual_fraud', 'Type': 'INTEGER'},
                     {'Name': 'prediction_match', 'Type': 'INTEGER'},
                     {'Name': 'prediction_category', 'Type': 'STRING'},

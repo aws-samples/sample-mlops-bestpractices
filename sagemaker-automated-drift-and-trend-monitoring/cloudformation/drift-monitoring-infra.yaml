@@ -124,6 +124,19 @@ Resources:
   # The drift-monitor Lambda emits one message per run; the writer Lambda
   # below drains it into the monitoring_responses Athena table.
   # =========================================================================
+  # Dead-letter queue: poison messages that fail maxReceiveCount deliveries
+  # land here instead of blocking the main queue or being retried forever.
+  MonitoringResultsDLQ:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${MonitoringQueueName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
   MonitoringResultsQueue:
     Type: AWS::SQS::Queue
     DeletionPolicy: Delete
@@ -132,6 +145,9 @@ Resources:
       QueueName: !Ref MonitoringQueueName
       VisibilityTimeout: 300
       MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MonitoringResultsDLQ.Arn
+        maxReceiveCount: 5
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -202,28 +218,56 @@ Resources:
           ATHENA_OUTPUT = os.environ['ATHENA_OUTPUT']
 
           def lambda_handler(event, context):
-              """Process SQS messages and write monitoring results to Athena."""
-              print(f"Processing {len(event['Records'])} messages")
-              for record in event['Records']:
+              """Process SQS messages and write monitoring results to Athena.
+
+              Returns partial batch failures (ReportBatchItemFailures): only the
+              message IDs that failed are reported, so good records are deleted
+              and not reprocessed while a poison record is retried on its own and
+              eventually moved to the DLQ after maxReceiveCount attempts.
+              """
+              records = event.get('Records', [])
+              print(f"Processing {len(records)} messages")
+              # Leave a safety margin before the Lambda timeout: return the
+              # UNATTEMPTED records as batchItemFailures if we're about to run
+              # out of time, so SQS redelivers them to a fresh invocation
+              # instead of the runtime killing us mid-write (which strands the
+              # whole in-flight batch and blocks the queue).
+              SAFETY_MS = 5000
+              batch_item_failures = []
+              for idx, record in enumerate(records):
+                  message_id = record.get('messageId')
+                  remaining = context.get_remaining_time_in_millis() if context else None
+                  if remaining is not None and remaining < SAFETY_MS:
+                      deferred = records[idx:]
+                      print(f"Approaching timeout ({remaining} ms left); deferring "
+                            f"{len(deferred)} unattempted record(s) for retry")
+                      for r in deferred:
+                          batch_item_failures.append({'itemIdentifier': r.get('messageId')})
+                      break
                   try:
                       body = json.loads(record['body'])
-                      write_to_athena(body)
+                      write_to_athena(body, context)
                   except Exception as e:
-                      print(f"Error processing message: {e}")
-                      raise
-              return {'statusCode': 200, 'processed': len(event['Records'])}
+                      print(f"Error processing message {message_id}: {e}")
+                      batch_item_failures.append({'itemIdentifier': message_id})
+              return {'batchItemFailures': batch_item_failures}
 
-          def write_to_athena(data):
-              """Write one monitoring result row to the Iceberg table.
+          def write_to_athena(data, context=None):
+              """Write one monitoring result row to the Iceberg table (idempotently).
 
-              Column list MUST match the monitoring_responses DDL exactly and
-              the INSERT built by notebook 3 Section 6.4. Adding/reordering
-              columns requires updating all three in lockstep.
+              Persistence is an Iceberg MERGE INTO keyed on monitoring_run_id:
+              the row is inserted only WHEN NOT MATCHED, so SQS at-least-once
+              redelivery of the same run is a no-op rather than a duplicate row.
+              (Athena engine v3 supports MERGE INTO for Apache Iceberg tables.)
+              The named column list is a plain projection, so column ORDER is
+              flexible. The authoritative monitoring_responses column set lives
+              in create_athena_tables.py (the DDL) and deploy_monitoring_writer.py
+              (the sibling writer); keep this copy in sync with those two.
               """
               columns = [
                   'monitoring_run_id', 'monitoring_timestamp',
                   'endpoint_name', 'model_version', 'model_package_arn',
-                  'evaluation_snapshot_id',
+                  'evaluation_snapshot_id', 'training_snapshot_id',
                   'data_drift_detected', 'drifted_columns_count', 'drifted_columns_share',
                   'features_analyzed', 'data_sample_size', 'model_drift_detected',
                   'baseline_roc_auc', 'current_roc_auc',
@@ -232,6 +276,9 @@ Resources:
                   'model_sample_size', 'per_feature_drift_scores',
                   'evidently_report_s3_path', 'mlflow_run_id',
                   'alert_sent', 'detection_engine', 'created_at',
+                  'problem_type', 'primary_metric', 'baseline_primary',
+                  'current_primary', 'mae', 'rmse', 'r2', 'execution_status',
+                  'data_drift_status', 'model_drift_status',
               ]
               timestamp_cols = {'monitoring_timestamp', 'created_at'}
 
@@ -252,8 +299,23 @@ Resources:
                       values.append(f"'{val_str}'")
 
               col_list = ', '.join(columns)
-              val_list = ', '.join(values)
-              query = f"INSERT INTO {ATHENA_DATABASE}.{ATHENA_TABLE} ({col_list}) VALUES ({val_list})"
+              # Idempotent + MONOTONIC write: MERGE a single-row source (each
+              # value aliased to its column) into the target on monitoring_run_id.
+              # Insert when new; when a row exists, UPDATE it ONLY to reconcile a
+              # prior best-effort ERROR row up to a real verdict (ERROR ->
+              # non-ERROR). A late/duplicate ERROR delivery can NOT regress an
+              # already-recorded SUCCESS back to ERROR.
+              select_cols = ', '.join(f"{v} AS {c}" for v, c in zip(values, columns))
+              insert_vals = ', '.join(f"s.{c}" for c in columns)
+              update_set = ', '.join(f"{c} = s.{c}" for c in columns if c != 'monitoring_run_id')
+              query = (
+                  f"MERGE INTO {ATHENA_DATABASE}.{ATHENA_TABLE} AS t "
+                  f"USING (SELECT {select_cols}) AS s "
+                  f"ON t.monitoring_run_id = s.monitoring_run_id "
+                  f"WHEN MATCHED AND t.execution_status = 'ERROR' AND s.execution_status <> 'ERROR' "
+                  f"THEN UPDATE SET {update_set} "
+                  f"WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_vals})"
+              )
 
               response = athena.start_query_execution(
                   QueryString=query,
@@ -263,11 +325,21 @@ Resources:
               execution_id = response['QueryExecutionId']
               print(f"Athena query started: {execution_id}")
 
+              # Bound the poll by the invocation's remaining time so a slow
+              # query can't run us into the hard Lambda timeout (killing the
+              # process mid-poll). If we're about to run out, raise so the caller
+              # returns this record as a batchItemFailure for a clean SQS retry.
+              SAFETY_MS = 3000
               while True:
                   status = athena.get_query_execution(QueryExecutionId=execution_id)
                   state = status['QueryExecution']['Status']['State']
                   if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
                       break
+                  if context is not None and context.get_remaining_time_in_millis() < SAFETY_MS:
+                      raise Exception(
+                          f"Athena query {execution_id} still {state} with "
+                          f"< {SAFETY_MS} ms remaining; deferring for SQS retry"
+                      )
                   time.sleep(0.5)
 
               if state == 'SUCCEEDED':
@@ -286,6 +358,10 @@ Resources:
       FunctionName: !Ref MonitoringWriterFunction
       BatchSize: 10
       MaximumBatchingWindowInSeconds: 5
+      # Honor the handler's batchItemFailures response so a poison record is
+      # retried on its own (then DLQ'd) instead of failing the whole batch.
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
 
   # =========================================================================
   # IAM role for the SCHEDULED (container) drift-monitor Lambda.
@@ -324,6 +400,15 @@ Resources:
               - Effect: Allow
                 Action: 'sns:Publish'
                 Resource: !Ref DriftAlertsTopic
+              # Emit CloudWatch drift metrics every run (incl. the heartbeat).
+              # PutMetricData has no resource-level ARN, so Resource '*' scoped
+              # by the namespace condition is the correct least-privilege idiom.
+              - Effect: Allow
+                Action: 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': !Ref MetricNamespace
               # Write Athena query results + Evidently HTML reports.
               - Effect: Allow
                 Action:
@@ -348,13 +433,16 @@ Resources:
   # CloudWatch alarms — fire on the metrics the drift-monitor Lambda publishes.
   # AlarmActions notify the SNS topic (the imperative script left this unwired).
   # =========================================================================
+  # Deliberate early-warning tier: fires on the share of drifted columns
+  # BEFORE the run's overall data-drift verdict (DataDriftDetected) trips —
+  # a leading indicator that individual features are shifting.
   DataDriftPsiAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: 'FraudDetection-DataDrift-PSI'
-      AlarmDescription: !Sub 'Data drift: average PSI exceeds ${DataDriftThreshold} (distribution shift).'
+      AlarmDescription: !Sub 'Data drift early-warning: share of drifted columns exceeds ${DataDriftThreshold}.'
       Namespace: !Ref MetricNamespace
-      MetricName: 'DataDriftPSI'
+      MetricName: 'DriftedColumnsShare'
       Statistic: Average
       Period: 300
       EvaluationPeriods: 1
@@ -371,9 +459,9 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: 'FraudDetection-ModelDrift-ROCAUCDEGRADATION'
-      AlarmDescription: !Sub 'Model drift: ROC-AUC degradation exceeds ${ModelDriftThreshold}.'
+      AlarmDescription: !Sub 'Model drift: relative degradation of the primary metric (ROC-AUC / accuracy / RMSE) from baseline exceeds ${ModelDriftThreshold}.'
       Namespace: !Ref MetricNamespace
-      MetricName: 'ROCAUCDegradation'
+      MetricName: 'PrimaryMetricDegradationRatio'
       Statistic: Average
       Period: 300
       EvaluationPeriods: 1
@@ -386,62 +474,72 @@ Resources:
       AlarmActions:
         - !Ref DriftAlertsTopic
 
-  ModelDriftAccuracyAlarm:
+  # Repurposed (was ModelDriftAccuracyAlarm): the old alarm fired
+  # GreaterThanThreshold on the RAW Accuracy metric vs ModelDriftThreshold
+  # (~0.1), i.e. whenever accuracy > 0.1 — effectively ALWAYS. Replaced with a
+  # heartbeat / no-data alarm: DriftRunExecuted is emitted on every scheduled
+  # run, so its absence over ~25h means the schedule stalled. Not referenced in
+  # Outputs, so the logical ID was renamed for clarity (the dashboard alarm
+  # strip references it by AlarmName, updated below).
+  DriftMonitorHeartbeatAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-ACCURACY'
-      AlarmDescription: !Sub 'Model drift: accuracy degradation exceeds ${ModelDriftThreshold}.'
+      AlarmName: 'FraudDetection-DriftMonitor-NoHeartbeat'
+      AlarmDescription: 'The scheduled drift monitor has not run (no DriftRunExecuted heartbeat) in the expected window.'
       Namespace: !Ref MetricNamespace
-      MetricName: 'Accuracy'
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: !Ref ModelDriftThreshold
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
+      MetricName: 'DriftRunExecuted'
+      Statistic: Sum
+      # Rolling ~25h window (one daily run + slack) built from 25 consecutive
+      # 1h periods. A single 90000s period snapped to fixed CloudWatch period
+      # boundaries could take ~50h to detect a missed daily run; requiring 25
+      # consecutive breaching/missing 1h datapoints gives a rolling window that
+      # detects the miss within ~1h of the 25h mark.
+      Period: 3600
+      EvaluationPeriods: 25
+      DatapointsToAlarm: 25
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
       Dimensions:
         - Name: Endpoint
           Value: !Ref EndpointName
       AlarmActions:
         - !Ref DriftAlertsTopic
 
-  ModelDriftPrecisionAlarm:
+  # Surfaces monitoring rows that failed to persist. After maxReceiveCount
+  # redeliveries the writer's poison/timed-out records land in the DLQ; without
+  # this alarm they sit there silently and the monitoring history is quietly
+  # incomplete. Any visible DLQ message pages the same SNS topic. TreatMissingData
+  # is notBreaching so an empty DLQ (the normal state, no metric emitted) stays OK.
+  MonitoringWriterDLQAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: 'FraudDetection-ModelDrift-PRECISION'
-      AlarmDescription: !Sub 'Model drift: precision degradation exceeds ${ModelDriftThreshold}.'
-      Namespace: !Ref MetricNamespace
-      MetricName: 'Precision'
-      Statistic: Average
+      AlarmName: 'FraudDetection-MonitoringWriter-DLQ'
+      AlarmDescription: 'Monitoring-writer records landed in the DLQ — some monitoring rows failed to persist after retries.'
+      Namespace: 'AWS/SQS'
+      MetricName: 'ApproximateNumberOfMessagesVisible'
+      Statistic: Maximum
       Period: 300
       EvaluationPeriods: 1
-      Threshold: !Ref ModelDriftThreshold
+      DatapointsToAlarm: 1
+      Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       Dimensions:
-        - Name: Endpoint
-          Value: !Ref EndpointName
+        - Name: QueueName
+          Value: !GetAtt MonitoringResultsDLQ.QueueName
       AlarmActions:
         - !Ref DriftAlertsTopic
 
-  ModelDriftRecallAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: 'FraudDetection-ModelDrift-RECALL'
-      AlarmDescription: !Sub 'Model drift: recall degradation exceeds ${ModelDriftThreshold}.'
-      Namespace: !Ref MetricNamespace
-      MetricName: 'Recall'
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: !Ref ModelDriftThreshold
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-      Dimensions:
-        - Name: Endpoint
-          Value: !Ref EndpointName
-      AlarmActions:
-        - !Ref DriftAlertsTopic
+  # NOTE: The former ModelDriftPrecisionAlarm / ModelDriftRecallAlarm resources
+  # were REMOVED. They alarmed GreaterThanThreshold on the RAW Precision / Recall
+  # metrics (~0.8) vs ModelDriftThreshold (~0.05), so they fired on essentially
+  # every publish — a false positive by construction (Precision/Recall are raw
+  # quality metrics, not degradation ratios, and have no meaningful fixed
+  # GreaterThan threshold). The model-drift condition is already covered by
+  # ModelDriftRocAucAlarm (PrimaryMetricDegradationRatio) and the Lambda's
+  # ModelDriftDetected metric. Precision/Recall now appear only as raw-value
+  # time series on the "Model Quality - Current Metrics" dashboard widget.
 
   # =========================================================================
   # CloudWatch dashboard — data-drift PSI + model-drift degradation trends
@@ -466,12 +564,12 @@ Resources:
               "x": 0, "y": 2, "width": 12, "height": 6,
               "properties": {
                 "metrics": [
-                  ["${MetricNamespace}", "DataDriftPSI", "Endpoint", "${EndpointName}", {"stat": "Average"}]
+                  ["${MetricNamespace}", "DriftedColumnsShare", "Endpoint", "${EndpointName}", {"stat": "Average"}]
                 ],
                 "view": "timeSeries",
                 "stacked": false,
                 "region": "${AWS::Region}",
-                "title": "Data Drift - Population Stability Index (PSI)",
+                "title": "Data Drift - Share of Drifted Columns",
                 "period": 300,
                 "yAxis": {"left": {"min": 0, "max": 1}},
                 "annotations": {
@@ -486,10 +584,8 @@ Resources:
               "x": 12, "y": 2, "width": 12, "height": 6,
               "properties": {
                 "metrics": [
-                  ["${MetricNamespace}", "ROCAUCDegradation", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "ROC-AUC Degradation"}],
-                  ["${MetricNamespace}", "Accuracy", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Accuracy Degradation"}],
-                  ["${MetricNamespace}", "Precision", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Precision Degradation"}],
-                  ["${MetricNamespace}", "Recall", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Recall Degradation"}]
+                  ["${MetricNamespace}", "PrimaryMetricDegradationRatio", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Primary Metric Degradation (relative)"}],
+                  ["${MetricNamespace}", "ROCAUCDegradation", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "ROC-AUC Degradation (absolute, binary)"}]
                 ],
                 "view": "timeSeries",
                 "stacked": false,
@@ -505,16 +601,33 @@ Resources:
               }
             },
             {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${MetricNamespace}", "Accuracy", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Accuracy"}],
+                  ["${MetricNamespace}", "Precision", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Precision"}],
+                  ["${MetricNamespace}", "Recall", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Recall"}],
+                  ["${MetricNamespace}", "CurrentROCAUC", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Current ROC-AUC"}],
+                  ["${MetricNamespace}", "BaselineROCAUC", "Endpoint", "${EndpointName}", {"stat": "Average", "label": "Baseline ROC-AUC"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Model Quality - Current Metrics",
+                "period": 300,
+                "yAxis": {"left": {"min": 0, "max": 1}}
+              }
+            },
+            {
               "type": "alarm",
-              "x": 0, "y": 8, "width": 24, "height": 4,
+              "x": 12, "y": 8, "width": 12, "height": 6,
               "properties": {
                 "title": "Drift Alarms Status",
                 "alarms": [
                   "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-DataDrift-PSI",
                   "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ROCAUCDEGRADATION",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-ACCURACY",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-PRECISION",
-                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-ModelDrift-RECALL"
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:FraudDetection-DriftMonitor-NoHeartbeat"
                 ]
               }
             }

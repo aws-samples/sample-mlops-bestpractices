@@ -53,19 +53,53 @@ def deploy_monitoring_writer(region='us-east-1'):
     sqs = boto3.client('sqs', region_name=region)
     lambda_client = boto3.client('lambda', region_name=region)
 
-    # Step 1: Create SQS queue
+    # Step 1: Create SQS queue (+ dead-letter queue)
     print("[1/5] Creating SQS queue...")
+
+    # Dead-letter queue first — poison messages that fail maxReceiveCount
+    # deliveries land here instead of blocking the main queue forever.
+    dlq_name = queue_name + '-dlq'
+    try:
+        dlq_url = sqs.create_queue(
+            QueueName=dlq_name,
+            Attributes={
+                'MessageRetentionPeriod': '1209600',  # 14 days
+            }
+        )['QueueUrl']
+        print(f"  ✓ DLQ created: {dlq_url}")
+    except sqs.exceptions.QueueNameExists:
+        dlq_url = sqs.get_queue_url(QueueName=dlq_name)['QueueUrl']
+        print(f"  ✓ DLQ exists: {dlq_url}")
+
+    dlq_arn = sqs.get_queue_attributes(
+        QueueUrl=dlq_url,
+        AttributeNames=['QueueArn']
+    )['Attributes']['QueueArn']
+
+    # Redrive policy: after maxReceiveCount failed receives a message is moved
+    # to the DLQ. Applied on both create and reuse so existing queues get it.
+    redrive_policy = json.dumps({
+        'deadLetterTargetArn': dlq_arn,
+        'maxReceiveCount': 5,
+    })
+
     try:
         queue_url = sqs.create_queue(
             QueueName=queue_name,
             Attributes={
                 'VisibilityTimeout': '300',  # 5 minutes
                 'MessageRetentionPeriod': '1209600',  # 14 days
+                'RedrivePolicy': redrive_policy,
             }
         )['QueueUrl']
         print(f"  ✓ Queue created: {queue_url}")
     except sqs.exceptions.QueueNameExists:
         queue_url = sqs.get_queue_url(QueueName=queue_name)['QueueUrl']
+        # Ensure the redrive policy is present on a pre-existing queue.
+        sqs.set_queue_attributes(
+            QueueUrl=queue_url,
+            Attributes={'RedrivePolicy': redrive_policy}
+        )
         print(f"  ✓ Queue exists: {queue_url}")
 
     queue_arn = sqs.get_queue_attributes(
@@ -128,30 +162,55 @@ ATHENA_TABLE = os.environ['ATHENA_TABLE']
 ATHENA_OUTPUT = os.environ['ATHENA_OUTPUT']
 
 def lambda_handler(event, context):
-    """Process SQS messages and write to Athena."""
-    print(f"Processing {len(event['Records'])} messages")
+    """Process SQS messages and write to Athena.
 
-    for record in event['Records']:
+    Uses partial batch response (ReportBatchItemFailures): only the message
+    IDs that failed are returned in batchItemFailures, so successful records
+    are deleted from the queue and NOT reprocessed, while a single poison
+    record does not block the rest of the batch. After maxReceiveCount
+    redeliveries a persistently failing record is moved to the DLQ.
+    """
+    records = event.get('Records', [])
+    print(f"Processing {len(records)} messages")
+
+    # Leave a safety margin before the Lambda timeout: if we're about to run
+    # out of time, return the UNATTEMPTED records as batchItemFailures so SQS
+    # redelivers them to a fresh invocation, rather than the runtime killing us
+    # mid-write (which strands the whole in-flight batch and blocks the queue).
+    SAFETY_MS = 5000
+    batch_item_failures = []
+    for idx, record in enumerate(records):
+        message_id = record.get('messageId')
+        remaining = context.get_remaining_time_in_millis() if context else None
+        if remaining is not None and remaining < SAFETY_MS:
+            deferred = records[idx:]
+            print(f"Approaching timeout ({remaining} ms left); deferring "
+                  f"{len(deferred)} unattempted record(s) for retry")
+            for r in deferred:
+                batch_item_failures.append({'itemIdentifier': r.get('messageId')})
+            break
         try:
             body = json.loads(record['body'])
-            write_to_athena(body)
+            write_to_athena(body, context)
         except Exception as e:
-            print(f"Error processing message: {e}")
-            raise
+            print(f"Error processing message {message_id}: {e}")
+            batch_item_failures.append({'itemIdentifier': message_id})
 
-    return {'statusCode': 200, 'processed': len(event['Records'])}
+    return {'batchItemFailures': batch_item_failures}
 
-def write_to_athena(data):
-    """Write monitoring result to Athena Iceberg table.
+def write_to_athena(data, context=None):
+    """Write monitoring result to Athena Iceberg table (idempotently).
 
-    Column list MUST match the CFN `monitoring_responses` DDL exactly —
-    INSERT VALUES with no column list is positional, so adding or
-    reordering columns in CFN requires the same change here.
+    Persistence is an Iceberg MERGE INTO keyed on monitoring_run_id: the row
+    is inserted only WHEN NOT MATCHED, so SQS at-least-once redelivery of the
+    same run is a no-op instead of a duplicate row. (Athena engine v3 supports
+    MERGE INTO for Apache Iceberg tables.) The named column list is a plain
+    projection here, so column ORDER is flexible.
 
-    ⚠️ Source of truth: cloudformation/sagemaker-mlflow-setup.yaml
-    monitoring_responses DDL block (search for "monitoring_run_id STRING,
-    monitoring_timestamp TIMESTAMP"). Editing one without the other will
-    cause silent INSERT failures or column misalignment.
+    ⚠️ Source of truth: cloudformation/sagemaker-mlflow-setup.yaml AND
+    src/setup/create_athena_tables.py monitoring_responses DDL block (search for
+    "monitoring_run_id STRING, monitoring_timestamp TIMESTAMP"). Editing one
+    without the others will cause silent INSERT failures or column misalignment.
     """
     columns = [
         'monitoring_run_id', 'monitoring_timestamp',
@@ -165,6 +224,13 @@ def write_to_athena(data):
         'model_sample_size', 'per_feature_drift_scores',
         'evidently_report_s3_path', 'mlflow_run_id',
         'alert_sent', 'detection_engine', 'created_at',
+        # Problem-type-aware columns (nullable), appended after created_at to
+        # match the monitoring_responses DDL. Numeric ones serialize via the
+        # int/float branch, the two STRING ones via the string branch; none are
+        # timestamps, so timestamp_cols is unchanged.
+        'problem_type', 'primary_metric', 'baseline_primary', 'current_primary',
+        'mae', 'rmse', 'r2', 'execution_status',
+        'data_drift_status', 'model_drift_status',
     ]
 
     timestamp_cols = {'monitoring_timestamp', 'created_at'}
@@ -187,10 +253,25 @@ def write_to_athena(data):
             values.append(f"'{val_str}'")
 
     col_list = ', '.join(columns)
-    val_list = ', '.join(values)
+    # Idempotent + MONOTONIC write: MERGE the single-row source (built from the
+    # values above, each aliased to its column name) into the target on
+    # monitoring_run_id. Insert when the run is new; when a row already exists,
+    # UPDATE it ONLY to reconcile a prior best-effort ERROR row up to a real
+    # verdict (ERROR → non-ERROR). This lets a retry that first wrote ERROR then
+    # succeeded overwrite the ERROR row, WITHOUT letting a late/duplicate ERROR
+    # delivery regress an already-recorded SUCCESS back to ERROR.
+    select_cols = ', '.join(f"{v} AS {c}" for v, c in zip(values, columns))
+    insert_vals = ', '.join(f"s.{c}" for c in columns)
+    update_set = ', '.join(
+        f"{c} = s.{c}" for c in columns if c != 'monitoring_run_id'
+    )
     query = f"""
-    INSERT INTO {ATHENA_DATABASE}.{ATHENA_TABLE} ({col_list})
-    VALUES ({val_list})
+    MERGE INTO {ATHENA_DATABASE}.{ATHENA_TABLE} AS t
+    USING (SELECT {select_cols}) AS s
+    ON t.monitoring_run_id = s.monitoring_run_id
+    WHEN MATCHED AND t.execution_status = 'ERROR' AND s.execution_status <> 'ERROR'
+        THEN UPDATE SET {update_set}
+    WHEN NOT MATCHED THEN INSERT ({col_list}) VALUES ({insert_vals})
     """
 
     # Execute query
@@ -203,12 +284,22 @@ def write_to_athena(data):
     execution_id = response['QueryExecutionId']
     print(f"Athena query started: {execution_id}")
 
-    # Wait for completion
+    # Wait for completion, but BOUND the poll by the invocation's remaining
+    # time so a slow query can't run us into the hard Lambda timeout (which
+    # would kill the process mid-poll and leave the record unacked at an
+    # unpredictable point). If we're about to run out, raise so the caller
+    # returns this record as a batchItemFailure for a clean SQS retry.
+    SAFETY_MS = 3000
     while True:
         status = athena.get_query_execution(QueryExecutionId=execution_id)
         state = status['QueryExecution']['Status']['State']
         if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
             break
+        if context is not None and context.get_remaining_time_in_millis() < SAFETY_MS:
+            raise Exception(
+                f"Athena query {execution_id} still {state} with "
+                f"< {SAFETY_MS} ms remaining; deferring for SQS retry"
+            )
         time.sleep(0.5)
 
     if state == 'SUCCEEDED':
@@ -285,7 +376,10 @@ def write_to_athena(data):
             EventSourceArn=queue_arn,
             FunctionName=lambda_name,
             BatchSize=10,
-            MaximumBatchingWindowInSeconds=5
+            MaximumBatchingWindowInSeconds=5,
+            # Honor the handler's batchItemFailures response so only failed
+            # records are retried (and eventually sent to the DLQ).
+            FunctionResponseTypes=['ReportBatchItemFailures']
         )
         print("  ✓ SQS trigger configured")
     except lambda_client.exceptions.ResourceConflictException:

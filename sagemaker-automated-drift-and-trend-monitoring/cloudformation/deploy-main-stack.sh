@@ -74,6 +74,7 @@ S3_TABLE_PREFIX="${S3_TABLE_PREFIX%/}"
 RESETTABLE_TABLES=(
   training_data evaluation_data inference_responses
   ground_truth ground_truth_updates monitoring_responses drifted_data
+  monitoring_run_inferences monitoring_run_generations monitoring_alerts
 )
 
 echo "=== Deploy CloudFormation Stack ==="
@@ -157,7 +158,7 @@ if [ "$RECREATE_DATABASE" = "true" ]; then
       echo "  ✓ All tables removed from catalog"
     fi
 
-    echo "Clearing 7 table S3 prefixes under s3://${DATA_BUCKET}/${S3_TABLE_PREFIX}/ ..."
+    echo "Clearing ${#RESETTABLE_TABLES[@]} table S3 prefixes under s3://${DATA_BUCKET}/${S3_TABLE_PREFIX}/ ..."
     for TBL in "${RESETTABLE_TABLES[@]}"; do
       PREFIX="${S3_TABLE_PREFIX}/${TBL}/"
       COUNT=$(aws s3 rm "s3://${DATA_BUCKET}/${PREFIX}" --recursive --region "$REGION" --only-show-errors 2>&1 | wc -l | tr -d ' ')

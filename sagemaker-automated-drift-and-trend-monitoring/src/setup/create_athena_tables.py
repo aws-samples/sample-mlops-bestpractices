@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Create the Athena database and all 7 Iceberg/external tables, driven
+Create the Athena database and all Iceberg/external tables, driven
 entirely by ``src/config/dataset_schema.yaml`` via ``src.config.schema``.
 
 This is the ONE place table DDL is generated. It replaces the CloudFormation
@@ -89,7 +89,7 @@ def _run_athena_query(
 
 
 def _table_ddls() -> Dict[str, str]:
-    """Generate CREATE TABLE DDL for all 7 tables from the schema config.
+    """Generate CREATE TABLE DDL for all registered tables from the schema config.
 
     Column list construction mirrors the design used everywhere else in
     the project: identifier first, then all feature columns (types pulled
@@ -142,19 +142,33 @@ LOCATION 's3://{bucket}/{prefix}/ground_truth/'
 TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
 """
 
+    # prediction/ground_truth are DOUBLE (not INT): regression models produce
+    # continuous predictions/targets that INT would truncate, making regression
+    # drift meaningless. Binary/multiclass integer labels 0/1/2... still
+    # round-trip losslessly through DOUBLE.
+    #
+    # MIGRATION: existing deployed Iceberg tables need the runbook in docs/
+    # (ADD COLUMNS for monitoring_responses; prediction/ground_truth int→double
+    # is NOT an Iceberg-safe promotion, so it needs table recreate + backfill).
+    # Fresh deployments get this directly.
     ddls["inference_responses"] = f"""
 CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.inference_responses (
     inference_id STRING, request_timestamp TIMESTAMP, endpoint_name STRING,
     model_version STRING, mlflow_run_id STRING,
     input_features STRING,
-    prediction INT, probability_fraud DOUBLE, probability_non_fraud DOUBLE, confidence_score DOUBLE,
-    ground_truth INT, ground_truth_timestamp TIMESTAMP, ground_truth_source STRING, days_to_ground_truth DOUBLE,
+    prediction DOUBLE, probability_fraud DOUBLE, probability_non_fraud DOUBLE, confidence_score DOUBLE,
+    ground_truth DOUBLE, ground_truth_timestamp TIMESTAMP, ground_truth_source STRING, days_to_ground_truth DOUBLE,
     inference_latency_ms DOUBLE, model_load_time_ms DOUBLE, preprocessing_time_ms DOUBLE,
     {id_col} STRING, transaction_amount DOUBLE, customer_id STRING,
     is_high_confidence BOOLEAN, is_low_confidence BOOLEAN, prediction_bucket STRING,
     request_id STRING, response_time TIMESTAMP, error_message STRING, inference_mode STRING,
     monitoring_run_id STRING
 )
+-- NOTE: `monitoring_run_id` above is LEGACY (superseded by the
+-- monitoring_run_inferences bridge table). It is retained for backward
+-- compatibility with existing data but is no longer written by the drift
+-- Lambda, and consumers (e.g. the governance dashboard) must join cohort
+-- membership through the bridge, which records EXACT per-check membership.
 PARTITIONED BY (day(request_timestamp), endpoint_name)
 LOCATION 's3://{bucket}/{prefix}/inference_responses/'
 TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
@@ -195,6 +209,21 @@ TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
     # a hardcoded `columns = [...]` list in its embedded Lambda code that
     # MUST mirror this DDL. Adding/removing columns requires editing BOTH
     # places. Order matters in the writer's parameterized INSERT.
+    # The trailing 10 columns (problem_type ... model_drift_status) are nullable
+    # and appended AFTER created_at so existing rows/positional appends stay
+    # safe. They make monitoring_responses problem-type-aware: the classification
+    # columns above (roc_auc_*, precision/recall/f1) only apply to binary runs,
+    # while these carry multiclass/regression results (primary_metric +
+    # baseline_primary/current_primary, mae/rmse/r2) and an explicit
+    # execution_status for per-run success/skip/error reporting. The two
+    # per-check statuses (data_drift_status, model_drift_status) record whether
+    # each check ran (SUCCESS / NO_DATA / INSUFFICIENT_* / null-if-not-executed)
+    # so a PARTIAL_SUCCESS run is distinguishable from a fully-successful one.
+    #
+    # MIGRATION: existing deployed Iceberg tables need the runbook in docs/
+    # (ADD COLUMNS for monitoring_responses; prediction/ground_truth int→double
+    # is NOT an Iceberg-safe promotion, so it needs table recreate + backfill).
+    # Fresh deployments get this directly.
     ddls["monitoring_responses"] = f"""
 CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.monitoring_responses (
     monitoring_run_id STRING, monitoring_timestamp TIMESTAMP,
@@ -207,10 +236,82 @@ CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.monitoring_responses (
     accuracy DOUBLE, precision DOUBLE, recall DOUBLE, f1_score DOUBLE,
     model_sample_size INT, per_feature_drift_scores STRING,
     evidently_report_s3_path STRING, mlflow_run_id STRING,
-    alert_sent BOOLEAN, detection_engine STRING, created_at TIMESTAMP
+    alert_sent BOOLEAN, detection_engine STRING, created_at TIMESTAMP,
+    problem_type STRING, primary_metric STRING,
+    baseline_primary DOUBLE, current_primary DOUBLE,
+    mae DOUBLE, rmse DOUBLE, r2 DOUBLE,
+    execution_status STRING,
+    data_drift_status STRING, model_drift_status STRING
 )
 PARTITIONED BY (day(monitoring_timestamp))
 LOCATION 's3://{bucket}/{prefix}/monitoring_responses/'
+TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+"""
+
+    # Run→inference membership bridge. Records the EXACT set of inference rows a
+    # given monitoring run scored, per check, so cohort membership is precise
+    # and reconstructable — not approximated by a timestamp window or a single
+    # mutable foreign key on inference_responses.
+    #
+    # WHY a bridge instead of inference_responses.monitoring_run_id:
+    #   * A run RE-SCORES an overlapping look-back window each time, drops
+    #     malformed/unparseable rows, and caps at a LIMIT — so "rows in
+    #     [lower, upper]" ≠ "rows actually scored". Only the exact ids do.
+    #   * Data drift (request-time cohort) and model quality (ground-truth-
+    #     arrival-time cohort) score DIFFERENT, overlapping row sets in the same
+    #     run. One scalar FK per inference row cannot represent both; a bridge
+    #     row per (run, inference, check_type) can.
+    # check_type ∈ {'data_drift','model_drift'}. Written idempotently by the
+    # drift Lambda (delete-by-run_id then insert) so a retry of the same
+    # (now stable) monitoring_run_id re-materializes identical membership.
+    ddls["monitoring_run_inferences"] = f"""
+CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.monitoring_run_inferences (
+    monitoring_run_id STRING, inference_id STRING, check_type STRING,
+    endpoint_name STRING, created_at TIMESTAMP
+)
+PARTITIONED BY (day(created_at))
+LOCATION 's3://{bucket}/{prefix}/monitoring_run_inferences/'
+TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+"""
+
+    # ------------------------------------------------------------------
+    # monitoring_run_generations — atomic membership-completion markers
+    # ------------------------------------------------------------------
+    # One marker row per (monitoring_run_id, check_type). The drift Lambda
+    # writes it ONLY after every monitoring_run_inferences row for that cohort
+    # is durably inserted AND count-verified (see _write_generation_marker).
+    # A consumer joins the bridge THROUGH a COMPLETE marker whose
+    # expected_count == actual_count, so a crash mid-insert (partial bridge, no
+    # marker) is never read as a whole cohort. Iceberg MERGE keeps it idempotent
+    # across retries of the same (stable) run_id.
+    ddls["monitoring_run_generations"] = f"""
+CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.monitoring_run_generations (
+    monitoring_run_id STRING, check_type STRING,
+    expected_count INT, actual_count INT,
+    status STRING, created_at TIMESTAMP
+)
+PARTITIONED BY (day(created_at))
+LOCATION 's3://{bucket}/{prefix}/monitoring_run_generations/'
+TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
+"""
+
+    # ------------------------------------------------------------------
+    # monitoring_alerts — durable notification outbox (exactly-once-ish)
+    # ------------------------------------------------------------------
+    # One row per (monitoring_run_id, alert_type). The drift Lambda stakes a
+    # PENDING claim before publishing to SNS, then flips it to SENT with the
+    # returned MessageId (see notify_drift_alert). A retry of the same run_id
+    # that sees SENT skips re-publishing, so an async EventBridge redelivery
+    # doesn't duplicate a drift alert. Iceberg MERGE keeps the claim idempotent.
+    ddls["monitoring_alerts"] = f"""
+CREATE TABLE IF NOT EXISTS {ATHENA_DATABASE}.monitoring_alerts (
+    monitoring_run_id STRING, alert_type STRING,
+    subject STRING, message STRING,
+    status STRING, sns_message_id STRING,
+    created_at TIMESTAMP, sent_at TIMESTAMP
+)
+PARTITIONED BY (day(created_at))
+LOCATION 's3://{bucket}/{prefix}/monitoring_alerts/'
 TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
 """
 
@@ -219,14 +320,15 @@ TBLPROPERTIES ('table_type' = 'ICEBERG', 'format' = 'parquet')
 
 # KEEP IN SYNC: mirrors cloudformation/deploy-stack.sh's RESETTABLE_TABLES
 # array. That script's --recreate-database flag drops the Athena database
-# and clears these same 7 tables' S3 data BEFORE a CFN deploy runs — it
+# and clears these same tables' S3 data BEFORE a CFN deploy runs — it
 # never calls this script directly. This script owns table CREATION;
 # deploy-stack.sh owns the pre-deploy wipe. Keep both lists' table names
 # identical.
 ALL_TABLE_NAMES: List[str] = [
     "training_data", "evaluation_data", "ground_truth",
     "inference_responses", "drifted_data", "ground_truth_updates",
-    "monitoring_responses",
+    "monitoring_responses", "monitoring_run_inferences",
+    "monitoring_run_generations", "monitoring_alerts",
 ]
 
 # KEEP IN SYNC: mirrors src/train_pipeline/athena/schema_definitions.py's
@@ -235,9 +337,11 @@ ALL_TABLE_NAMES: List[str] = [
 ICEBERG_TABLES: List[str] = [
     'training_data', 'evaluation_data', 'ground_truth',
     'inference_responses', 'ground_truth_updates', 'monitoring_responses',
+    'monitoring_run_inferences', 'monitoring_run_generations', 'monitoring_alerts',
 ]
 PARTITIONED_TABLES: List[str] = [
     'ground_truth', 'inference_responses', 'ground_truth_updates', 'monitoring_responses',
+    'monitoring_run_inferences', 'monitoring_run_generations', 'monitoring_alerts',
 ]
 
 
@@ -474,12 +578,12 @@ def expire_snapshots(table_name: str, older_than_days: int = 7) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Create Athena database + all 7 tables from dataset_schema.yaml"
+        description="Create Athena database + all tables from dataset_schema.yaml"
     )
     parser.add_argument("--verify-only", action="store_true",
                         help="Only report current state; create nothing")
     parser.add_argument("--force-recreate", action="store_true",
-                        help="Drop and recreate all 7 tables against the CURRENT "
+                        help="Drop and recreate all tables against the CURRENT "
                              "dataset_schema.yaml. Destructive — all existing rows "
                              "in every table are lost.")
     parser.add_argument("--skip-s3", action="store_true",

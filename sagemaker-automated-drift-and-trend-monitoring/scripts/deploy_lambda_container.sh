@@ -65,6 +65,17 @@ SCHEDULE="$(get_config DRIFT_MONITOR_SCHEDULE)"
 REPO_NAME="$(get_config ECR_REPO_NAME)"
 MODEL_PACKAGE_GROUP_NAME="$(get_config MLFLOW_MODEL_NAME)"
 
+# Single source of truth for the CloudWatch namespace. Defaults to the CFN
+# MetricNamespace default (FraudDetection/DriftMonitoring). This ONE value is
+# used both in the IAM PutMetricData condition below AND passed to the Lambda
+# as CLOUDWATCH_NAMESPACE, so a custom namespace can't drift between the two
+# (which would otherwise cause AccessDenied or metrics-in-wrong-namespace).
+CLOUDWATCH_NAMESPACE="${CLOUDWATCH_NAMESPACE:-FraudDetection/DriftMonitoring}"
+
+# The monitoring results queue name is fixed; define it once so the IAM scope
+# (Step 2) and the env-var wiring (Step 5) resolve the same queue.
+SQS_QUEUE_NAME="fraud-monitoring-results"
+
 # Step 1: SNS Topic
 echo "[1/7] Creating SNS topic..."
 TOPIC_ARN=$(aws sns create-topic --name $SNS_TOPIC --region $REGION --query 'TopicArn' --output text 2>/dev/null || \
@@ -124,6 +135,72 @@ aws iam put-role-policy \
     --role-name $ROLE_NAME \
     --policy-name SNSPublishPolicy \
     --policy-document "$SNS_POLICY" \
+    --region $REGION 2>/dev/null || true
+
+# Add CloudWatch PutMetricData permission. The scheduled Lambda calls
+# cloudwatch.put_metric_data on every run (publish_cloudwatch_metrics in
+# lambda_drift_monitor.py); without this it fails silently with AccessDenied.
+# PutMetricData does not support resource-level ARNs, so Resource must be "*";
+# we scope it with a condition on the CLOUDWATCH_NAMESPACE the Lambda actually
+# publishes to (same $CLOUDWATCH_NAMESPACE passed to the function in Step 5).
+CLOUDWATCH_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["cloudwatch:PutMetricData"],
+    "Resource": "*",
+    "Condition": {
+      "StringEquals": {
+        "cloudwatch:namespace": "$CLOUDWATCH_NAMESPACE"
+      }
+    }
+  }]
+}
+EOF
+)
+
+aws iam put-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-name CloudWatchPutMetricPolicy \
+    --policy-document "$CLOUDWATCH_POLICY" \
+    --region $REGION 2>/dev/null || true
+
+# Add SQS send permission. The Lambda calls sqs.send_message against the
+# monitoring queue (MONITORING_SQS_QUEUE_URL). No managed policy grants SQS,
+# so add it inline. Scope it to the specific results queue ARN rather than "*":
+# resolve the ARN from the (fixed) queue name, falling back to the conventional
+# arn:aws:sqs:<region>:<account>:<name> pattern if the queue isn't created yet.
+SQS_QUEUE_ARN=""
+SQS_QUEUE_URL_FOR_ARN=$(aws sqs get-queue-url --queue-name "$SQS_QUEUE_NAME" --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
+if [ -n "$SQS_QUEUE_URL_FOR_ARN" ]; then
+    SQS_QUEUE_ARN=$(aws sqs get-queue-attributes --queue-url "$SQS_QUEUE_URL_FOR_ARN" --attribute-names QueueArn --region $REGION --query 'Attributes.QueueArn' --output text 2>/dev/null || echo "")
+fi
+[ -z "$SQS_QUEUE_ARN" ] && SQS_QUEUE_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${SQS_QUEUE_NAME}"
+
+# On-failure destination for the function's own ASYNCHRONOUS retries (see the
+# EventInvokeConfig block after the function is created). Lambda writes the
+# failed event to this queue using THIS execution role, so the role needs
+# sqs:SendMessage on it. Conventional name/ARN (queue is created later).
+ASYNC_DLQ_NAME="${LAMBDA_NAME}-async-dlq"
+ASYNC_DLQ_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${ASYNC_DLQ_NAME}"
+
+SQS_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["sqs:SendMessage"],
+    "Resource": ["$SQS_QUEUE_ARN", "$ASYNC_DLQ_ARN"]
+  }]
+}
+EOF
+)
+
+aws iam put-role-policy \
+    --role-name $ROLE_NAME \
+    --policy-name SQSSendPolicy \
+    --policy-document "$SQS_POLICY" \
     --region $REGION 2>/dev/null || true
 
 # Read the registered baseline.json from the Model Registry. The drift
@@ -293,7 +370,7 @@ echo "[5/7] Deploying Lambda function..."
 
 # Get MLflow tracking URI if available
 MLFLOW_URI=$(aws sagemaker list-mlflow-tracking-servers --region $REGION --query 'TrackingServerSummaries[0].TrackingServerArn' --output text 2>/dev/null || echo "")
-SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name fraud-monitoring-results --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
+SQS_QUEUE_URL=$(aws sqs get-queue-url --queue-name "$SQS_QUEUE_NAME" --region $REGION --query 'QueueUrl' --output text 2>/dev/null || echo "")
 
 # Endpoint name from config.py (single source). lambda_drift_monitor.py
 # uses this for the row it writes to monitoring_responses.
@@ -334,6 +411,7 @@ cat > "$ENV_FILE" <<EOF
     "KS_PVALUE_THRESHOLD": "0.05",
     "MODEL_DRIFT_THRESHOLD": "$MODEL_DRIFT_THRESHOLD",
     "MONITORING_SQS_QUEUE_URL": "$SQS_QUEUE_URL",
+    "CLOUDWATCH_NAMESPACE": "$CLOUDWATCH_NAMESPACE",
     "DATA_DRIFT_LOOKBACK_DAYS": "1",
     "MODEL_DRIFT_LOOKBACK_DAYS": "1",
     "ENDPOINT_NAME": "$ENDPOINT_NAME_FOR_LAMBDA",
@@ -408,6 +486,32 @@ else
     exit 1
 fi
 
+# Asynchronous-invoke retry policy + on-failure destination.
+#
+# EventBridge invokes this function ASYNCHRONOUSLY. The EventBridge target
+# RetryPolicy/DeadLetterConfig configured in Step 6 only covers EventBridge
+# FAILING TO DELIVER the event into Lambda's async queue (throttling,
+# function-not-ready). Once Lambda accepts the invocation (HTTP 202), a handler
+# exception — the ERROR path in lambda_handler — is governed by LAMBDA's own
+# async retry policy, NOT EventBridge, and after those retries are exhausted the
+# event is dropped SILENTLY unless an on-failure destination is set. So without
+# this block a scoring bug that raises on every attempt would retry twice and
+# then vanish with no DLQ record. Pin the retry count/age and route exhausted
+# failures to a dedicated SQS DLQ so a persistently broken monitor is visible.
+echo ""
+echo "[6a/7] Configuring async retry + on-failure destination..."
+ASYNC_DLQ_URL=$(aws sqs create-queue --queue-name "$ASYNC_DLQ_NAME" --region $REGION --query 'QueueUrl' --output text 2>/dev/null || \
+                aws sqs get-queue-url --queue-name "$ASYNC_DLQ_NAME" --region $REGION --query 'QueueUrl' --output text)
+ASYNC_DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$ASYNC_DLQ_URL" --attribute-names QueueArn --region $REGION --query 'Attributes.QueueArn' --output text)
+
+aws lambda put-function-event-invoke-config \
+    --function-name $LAMBDA_NAME \
+    --maximum-retry-attempts 1 \
+    --maximum-event-age-in-seconds 3600 \
+    --destination-config "{\"OnFailure\": {\"Destination\": \"$ASYNC_DLQ_ARN\"}}" \
+    --region $REGION > /dev/null
+echo "  ✓ Async on-failure DLQ: $ASYNC_DLQ_ARN (maxRetry=1, maxAge=3600s)"
+
 # Step 6: EventBridge Rule
 echo ""
 echo "[6/7] Creating EventBridge schedule..."
@@ -418,10 +522,64 @@ aws events put-rule \
     --description "Trigger drift monitoring Lambda" \
     --region $REGION > /dev/null
 
+RULE_ARN="arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}"
+
+# Dead-letter queue for the EventBridge target. Without a DLQ + retry policy,
+# a failed delivery to the Lambda (throttling, function-not-ready, etc.) is
+# silently dropped and the scheduled run just never happens. Create an SQS DLQ,
+# grant EventBridge permission to send to it (scoped to THIS rule's ARN), and
+# attach a RetryPolicy + DeadLetterConfig to the target below.
+DLQ_NAME="${RULE_NAME}-dlq"
+DLQ_URL=$(aws sqs create-queue --queue-name "$DLQ_NAME" --region $REGION --query 'QueueUrl' --output text 2>/dev/null || \
+          aws sqs get-queue-url --queue-name "$DLQ_NAME" --region $REGION --query 'QueueUrl' --output text)
+DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn --region $REGION --query 'Attributes.QueueArn' --output text)
+
+# Allow events.amazonaws.com to SendMessage to the DLQ, but only for this rule.
+DLQ_QUEUE_POLICY=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowEventBridgeDLQ",
+    "Effect": "Allow",
+    "Principal": {"Service": "events.amazonaws.com"},
+    "Action": "sqs:SendMessage",
+    "Resource": "$DLQ_ARN",
+    "Condition": {
+      "ArnEquals": {"aws:SourceArn": "$RULE_ARN"}
+    }
+  }]
+}
+EOF
+)
+aws sqs set-queue-attributes \
+    --queue-url "$DLQ_URL" \
+    --attributes "$(jq -n --arg p "$DLQ_QUEUE_POLICY" '{Policy: $p}')" \
+    --region $REGION
+echo "  ✓ DLQ: $DLQ_ARN"
+
+# Target JSON (list) with retry + dead-letter config. Shorthand can't express
+# the nested RetryPolicy/DeadLetterConfig, so write JSON and pass via file://.
+TARGETS_FILE=$(mktemp -t eb-targets.XXXXXX.json)
+cat > "$TARGETS_FILE" <<EOF
+[
+  {
+    "Id": "1",
+    "Arn": "$FUNCTION_ARN",
+    "RetryPolicy": {
+      "MaximumRetryAttempts": 2,
+      "MaximumEventAgeInSeconds": 3600
+    },
+    "DeadLetterConfig": {
+      "Arn": "$DLQ_ARN"
+    }
+  }
+]
+EOF
 aws events put-targets \
     --rule $RULE_NAME \
-    --targets "Id=1,Arn=$FUNCTION_ARN" \
+    --targets "file://$TARGETS_FILE" \
     --region $REGION > /dev/null
+rm -f "$TARGETS_FILE"
 
 aws lambda add-permission \
     --function-name $LAMBDA_NAME \
@@ -441,20 +599,45 @@ aws lambda invoke \
     --region $REGION \
     /tmp/lambda_test_output.json > /tmp/lambda_test_response.json 2>&1
 
-STATUS_CODE=$(jq -r '.StatusCode' /tmp/lambda_test_response.json)
-if [ "$STATUS_CODE" = "200" ]; then
-    RESULT=$(jq -r '.statusCode' /tmp/lambda_test_output.json 2>/dev/null || echo "error")
-    if [ "$RESULT" = "200" ]; then
-        echo "  ✓ Lambda test successful!"
-        jq '.' /tmp/lambda_test_output.json | head -20
-    else
-        echo "  ⚠ Lambda executed but returned error:"
-        jq '.' /tmp/lambda_test_output.json
-    fi
-else
-    echo "  ❌ Lambda test failed:"
+# A successful HTTP invoke (StatusCode 200) does NOT mean the function
+# succeeded: Lambda still returns 200 when the handler raises, and flags it via
+# the FunctionError field in the invoke response metadata. So we fail the deploy
+# if ANY of these hold:
+#   - the invoke transport itself didn't return 200,
+#   - the response metadata carries a FunctionError (Handled/Unhandled),
+#   - the output payload carries an errorMessage/errorType (raised exception),
+#   - the payload's own statusCode is present and not 200.
+STATUS_CODE=$(jq -r '.StatusCode // empty' /tmp/lambda_test_response.json 2>/dev/null || echo "")
+FUNCTION_ERROR=$(jq -r '.FunctionError // empty' /tmp/lambda_test_response.json 2>/dev/null || echo "")
+PAYLOAD_ERROR=$(jq -r '.errorMessage // .errorType // empty' /tmp/lambda_test_output.json 2>/dev/null || echo "")
+PAYLOAD_STATUS=$(jq -r '.statusCode // empty' /tmp/lambda_test_output.json 2>/dev/null || echo "")
+
+if [ "$STATUS_CODE" != "200" ]; then
+    echo "  ❌ Lambda test failed (invoke StatusCode=$STATUS_CODE):"
     cat /tmp/lambda_test_response.json
+    exit 1
 fi
+
+if [ -n "$FUNCTION_ERROR" ]; then
+    echo "  ❌ Lambda executed but the function errored (FunctionError=$FUNCTION_ERROR):"
+    jq '.' /tmp/lambda_test_output.json 2>/dev/null || cat /tmp/lambda_test_output.json
+    exit 1
+fi
+
+if [ -n "$PAYLOAD_ERROR" ]; then
+    echo "  ❌ Lambda returned an error payload: $PAYLOAD_ERROR"
+    jq '.' /tmp/lambda_test_output.json 2>/dev/null || cat /tmp/lambda_test_output.json
+    exit 1
+fi
+
+if [ -n "$PAYLOAD_STATUS" ] && [ "$PAYLOAD_STATUS" != "200" ]; then
+    echo "  ❌ Lambda returned non-success statusCode=$PAYLOAD_STATUS:"
+    jq '.' /tmp/lambda_test_output.json 2>/dev/null || cat /tmp/lambda_test_output.json
+    exit 1
+fi
+
+echo "  ✓ Lambda test successful!"
+jq '.' /tmp/lambda_test_output.json | head -20
 
 # Save configuration
 echo ""

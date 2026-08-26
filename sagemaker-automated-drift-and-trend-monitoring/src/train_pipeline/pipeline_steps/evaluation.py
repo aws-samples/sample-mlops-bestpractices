@@ -634,7 +634,14 @@ def save_evaluation_report(
     # unknown versions.
     baseline_path = output_path / "baseline.json"
     baseline_data = {
-        'schema_version': 2,
+        # v3 adds problem_type + primary_metric so the drift Lambda can
+        # validate baseline content and pick the right primary metric without
+        # inferring it from which metric keys happen to be present. This
+        # pipeline trains a binary fraud classifier whose primary metric is
+        # ROC-AUC (matches _expected_primary_metric_key in the drift Lambda).
+        'schema_version': 3,
+        'problem_type': 'binary_classification',
+        'primary_metric': 'roc_auc',
         'created_at': pd.Timestamp.now().isoformat(),
         'model_package_group': model_package_group,
         'code_commit_sha': code_commit_sha,

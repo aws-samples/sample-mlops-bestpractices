@@ -200,6 +200,25 @@ def run_classification_report(
     relaxes to "at least 2 distinct classes must appear". Leave it False (the
     default) for the binary case, which is unchanged.
 
+    ⚠ Multiclass class-set consistency — the ">= 2 distinct classes" check is
+    NOT sufficient for the multiclass path. Evidently computes per-class metrics
+    for the CURRENT frame and then looks each of those classes up in the
+    REFERENCE result, while sklearn silently omits any class that never appears.
+    So on top of the "2+ classes" loop, multiclass adds two checks:
+
+      * every class present in ``current_df[target]`` must also be predicted at
+        least once in ``current_df[prediction]`` (else sklearn drops it and
+        Evidently raises a bare ``KeyError``); and
+      * every class present in ``current_df[target]`` must also appear in
+        ``baseline_df[target]`` (else the reference result has no entry to align
+        against and Evidently raises a bare ``KeyError``).
+
+    Passing ``labels=`` to ``MulticlassClassification`` does NOT prevent either
+    KeyError (verified on evidently 0.7.21), so both are validated up front and
+    raise a clear ``ValueError`` instead. The fix is to increase the sample size
+    or stratify the upstream query so every actual class is represented in the
+    predictions and covered by the baseline.
+
     ⚠ Evidently quirk — both class labels (0 AND 1) must appear in BOTH
     ``baseline_df`` and ``current_df``. If either side has only one class
     (common when sampling a highly-imbalanced eval set with a flat LIMIT),
@@ -226,7 +245,11 @@ def run_classification_report(
 
     Raises:
         ValueError: If either dataframe lacks both class labels (caught
-            early before Evidently crashes with a confusing KeyError).
+            early before Evidently crashes with a confusing KeyError). When
+            ``multiclass=True``, also raised if a class in ``current_df[target]``
+            is never predicted in ``current_df[prediction]``, or if a class in
+            ``current_df[target]`` never appears in ``baseline_df[target]`` —
+            both would otherwise surface as a bare Evidently ``KeyError``.
     """
     # Normalize label dtypes FIRST — this must happen before the class check
     # and before building the Evidently Datasets. Evidently's
@@ -269,6 +292,64 @@ def run_classification_report(
                     f"either increase the sample size, lower the decision threshold, "
                     f"or stratify the upstream query to guarantee class diversity."
                 )
+
+    # Multiclass-only pre-flight — the "< 2 unique" loop above guarantees each
+    # column has 2+ classes, but for MULTICLASS that is not enough. Evidently's
+    # ClassificationQualityByClass computes per-class metrics for the CURRENT
+    # frame and then, when rendering the reference column, looks each of those
+    # classes up in the REFERENCE result (see evidently
+    # core/metric_types.py::get_default_render_ref → `ref_result.values[k]`).
+    # sklearn's classification_report omits any class that never appears, so two
+    # situations raise a bare `KeyError` deep inside Evidently:
+    #   1. a class occurs in current[target] but the model never predicted it in
+    #      current[prediction] — sklearn drops it from the current per-class
+    #      report, then Evidently KeyErrors reading the missing class; and
+    #   2. a class occurs in current[target] but never in baseline[target] — the
+    #      reference result has no entry for it, so the ref-alignment lookup
+    #      KeyErrors.
+    # Passing `labels=` to MulticlassClassification does NOT prevent either
+    # KeyError (verified on evidently 0.7.21), so we validate and fail loudly.
+    # The binary path is untouched: it keeps the {0, 1}-both-present guarantee
+    # from the loop above and never enters this block.
+    if multiclass:
+        base_target = set(baseline_df[target_column].dropna().unique().tolist())
+        cur_target = set(current_df[target_column].dropna().unique().tolist())
+        cur_pred = set(current_df[prediction_column].dropna().unique().tolist())
+
+        # (1) Model must predict every class that actually occurs in current
+        #     ground truth, or sklearn omits it and Evidently KeyErrors.
+        unpredicted = cur_target - cur_pred
+        if unpredicted:
+            raise ValueError(
+                f"current_df: class(es) {sorted(unpredicted)} occur in "
+                f"{target_column!r} but were never predicted in "
+                f"{prediction_column!r} (current target classes "
+                f"{sorted(cur_target)}, predicted classes {sorted(cur_pred)}). "
+                f"Evidently's multiclass ClassificationPreset scores every class "
+                f"present in current[{target_column!r}], but sklearn omits classes "
+                f"that never appear as a prediction, so Evidently crashes with a "
+                f"confusing KeyError on the missing class. "
+                f"Increase the sample size, lower the decision threshold, or "
+                f"stratify the upstream query so every actual class is represented "
+                f"in the predictions."
+            )
+
+        # (2) Every class in current ground truth must also appear in the
+        #     baseline ground truth, or the reference result has nothing to align
+        #     the per-class metric against and Evidently KeyErrors.
+        missing_in_baseline = cur_target - base_target
+        if missing_in_baseline:
+            raise ValueError(
+                f"current_df: class(es) {sorted(missing_in_baseline)} occur in "
+                f"{target_column!r} but never appear in baseline_df[{target_column!r}] "
+                f"(baseline target classes {sorted(base_target)}, current target "
+                f"classes {sorted(cur_target)}). "
+                f"Evidently aligns per-class metrics between baseline and current, "
+                f"and a class present only in current has no reference entry, so it "
+                f"crashes with a confusing KeyError. "
+                f"Stratify the upstream query (or widen the baseline sample) so the "
+                f"baseline and current cover the same set of classes."
+            )
 
     classification = (
         MulticlassClassification(
